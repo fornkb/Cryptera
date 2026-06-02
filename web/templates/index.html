@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CRYPTERA v3.0 // Institutional SMC Terminal</title>
+    
+    <!-- Premium Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    
+    <!-- Icon System -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Glassmorphic Terminal Custom Styles -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <!-- Background Glowing Vector Blobs for Premium Depth -->
+    <div class="glow-bg-blob blob-purple"></div>
+    <div class="glow-bg-blob blob-blue"></div>
+    <div class="glow-bg-blob blob-emerald"></div>
+
+    <div class="terminal-container">
+        <!-- HEADER PANEL -->
+        <header class="terminal-header">
+            <div class="header-branding">
+                <div class="logo-icon">
+                    <i class="fa-solid fa-microchip-transistor animated-pulse"></i>
+                </div>
+                <div class="logo-text">
+                    <h1>CRYPTERA</h1>
+                    <span class="version-tag">v3.0 CORE // INSTITUTIONAL SMC ENGINE</span>
+                </div>
+            </div>
+            
+            <div class="header-status">
+                <div class="status-indicator">
+                    <span class="pulse-dot"></span>
+                    <span class="status-label">BINANCE FEED: ONLINE</span>
+                </div>
+                <div class="status-indicator">
+                    <i class="fa-solid fa-server"></i>
+                    <span class="status-label">LOCAL API: ACTIVE</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- MAIN TERMINAL BODY -->
+        <div class="terminal-body">
+            <!-- SIDEBAR CONTROL PANEL & HISTORY -->
+            <aside class="terminal-sidebar">
+                <div class="sidebar-card control-panel-card">
+                    <h3 class="section-title"><i class="fa-solid fa-sliders"></i> ENGINE CONTROLS</h3>
+                    
+                    <div class="form-group">
+                        <label for="symbol-selector">Trading Asset Pair</label>
+                        <div class="selector-wrapper">
+                            <select id="symbol-selector">
+                                <option value="SOL/USDT">SOL / USDT (Default)</option>
+                                <option value="BTC/USDT">BTC / USDT</option>
+                                <option value="ETH/USDT">ETH / USDT</option>
+                                <option value="CUSTOM">Custom Symbol...</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div id="custom-symbol-group" class="form-group hidden-animation">
+                        <label for="custom-symbol-input">Enter Custom Ticker</label>
+                        <input type="text" id="custom-symbol-input" placeholder="e.g. LINK/USDT" value="">
+                    </div>
+                    
+                    <button id="btn-run-analysis" class="glowing-btn">
+                        <span class="btn-text"><i class="fa-solid fa-radar"></i> GENERATE PLAN</span>
+                        <div class="loader hidden">
+                            <i class="fa-solid fa-circle-notch fa-spin"></i> RUNNING ENGINE...
+                        </div>
+                    </button>
+                </div>
+
+                <div class="sidebar-card history-card">
+                    <div class="history-header">
+                        <h3 class="section-title"><i class="fa-solid fa-history"></i> SNAPSHOT HISTORY</h3>
+                        <button id="btn-refresh-history" title="Refresh snapshot files"><i class="fa-solid fa-arrows-rotate"></i></button>
+                    </div>
+                    <div class="history-list-wrapper">
+                        <div id="history-list-loading" class="list-message hidden">
+                            <i class="fa-solid fa-spinner fa-spin"></i> Fetching snapshots...
+                        </div>
+                        <div id="history-list-empty" class="list-message">
+                            No snapshots saved. Run analysis to create one!
+                        </div>
+                        <ul id="history-list" class="history-list">
+                            <!-- Populated dynamically via JS -->
+                        </ul>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- MAIN WORKSPACE -->
+            <main class="terminal-workspace">
+                
+                <!-- WORKSPACE WELCOME (Renders when no active run is loaded) -->
+                <div id="workspace-welcome" class="welcome-screen">
+                    <div class="welcome-logo">
+                        <i class="fa-solid fa-chart-line-up"></i>
+                    </div>
+                    <h2>Welcome to Cryptera Trading Terminal</h2>
+                    <p>Select a trading pair in the engine controls, or browse past snapshots in history to render institutional-grade ICT, SMC, and Price Action trade plans.</p>
+                </div>
+
+                <!-- MAIN ANALYSIS VIEW -->
+                <div id="workspace-analysis" class="analysis-view hidden">
+                    
+                    <!-- TOP CARD ROW: MARKET STATE DIALS -->
+                    <section class="top-state-row">
+                        <!-- Regime Card -->
+                        <div class="state-card regime-card">
+                            <div class="state-icon"><i class="fa-solid fa-compass"></i></div>
+                            <div class="state-info">
+                                <span class="card-subtitle">GLOBAL REGIME</span>
+                                <h4 id="val-market-regime">RANGING / SIDEWAYS</h4>
+                            </div>
+                        </div>
+
+                        <!-- Fear & Greed Card -->
+                        <div class="state-card fng-card">
+                            <div class="state-icon"><i class="fa-solid fa-gauge-high"></i></div>
+                            <div class="state-info">
+                                <span class="card-subtitle">FEAR & GREED</span>
+                                <h4 id="val-fear-greed">50 / 100</h4>
+                            </div>
+                        </div>
+
+                        <!-- Funding Rate Card -->
+                        <div class="state-card funding-card">
+                            <div class="state-icon"><i class="fa-solid fa-percent"></i></div>
+                            <div class="state-info">
+                                <span class="card-subtitle">1H FUNDING RATE</span>
+                                <h4 id="val-funding-rate">0.0000%</h4>
+                            </div>
+                        </div>
+
+                        <!-- Supertrend Card -->
+                        <div class="state-card supertrend-card">
+                            <div class="state-icon"><i class="fa-solid fa-bolt"></i></div>
+                            <div class="state-info">
+                                <span class="card-subtitle">1H SUPERTREND</span>
+                                <h4 id="val-supertrend">BULLISH // 0.00</h4>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- CENTRAL WORKSPACE: CONFLUENCE & SMC GRID -->
+                    <section class="central-workspace-row">
+                        
+                        <!-- COLUMN 1: ACTIVE TRADE PLAN & CONFLUENCE -->
+                        <div class="workspace-column flex-4">
+                            <!-- Confluence Ring Card -->
+                            <div class="workspace-card confluence-card">
+                                <h3 class="section-title"><i class="fa-solid fa-bullseye"></i> CONFLUENCE ANALYSIS</h3>
+                                <div class="confluence-body">
+                                    <div class="confluence-visual">
+                                        <!-- Circular Progress SVG -->
+                                        <svg class="progress-ring" width="160" height="160">
+                                            <circle class="progress-ring-bg" stroke="rgba(255,255,255,0.05)" stroke-width="12" fill="transparent" r="70" cx="80" cy="80"/>
+                                            <circle id="confluence-score-ring" class="progress-ring-bar" stroke="#10b981" stroke-width="12" stroke-dasharray="439.8" stroke-dashoffset="439.8" stroke-linecap="round" fill="transparent" r="70" cx="80" cy="80"/>
+                                        </svg>
+                                        <div class="score-display">
+                                            <span id="val-confluence-score">0</span>
+                                            <span class="score-label">PTS</span>
+                                        </div>
+                                    </div>
+                                    <div class="confluence-metrics">
+                                        <div class="metric-row">
+                                            <span class="metric-label">Active Bias</span>
+                                            <span id="badge-bias" class="badge bg-neutral">NEUTRAL</span>
+                                        </div>
+                                        <div class="metric-row">
+                                            <span class="metric-label">Recommended Action</span>
+                                            <span id="badge-action" class="badge bg-neutral">HOLD</span>
+                                        </div>
+                                        <div class="metric-row">
+                                            <span class="metric-label">Entry Level</span>
+                                            <span id="val-entry" class="metric-value font-mono">N/A</span>
+                                        </div>
+                                        <div class="metric-row">
+                                            <span class="metric-label">Stop Loss (SL)</span>
+                                            <span id="val-stop-loss" class="metric-value font-mono text-red">N/A</span>
+                                        </div>
+                                        <div class="metric-row">
+                                            <span class="metric-label">Take Profit (TP)</span>
+                                            <span id="val-take-profit" class="metric-value font-mono text-green">N/A</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="score-breakdown-wrapper">
+                                    <h4 class="card-subtitle-small">SCORE BREAKDOWN MATRIX</h4>
+                                    <div class="breakdown-grid">
+                                        <div class="breakdown-item">
+                                            <span class="item-lbl">Trend (20pt)</span>
+                                            <span id="score-trend" class="item-val font-mono">0</span>
+                                        </div>
+                                        <div class="breakdown-item">
+                                            <span class="item-lbl">OB Prox (20pt)</span>
+                                            <span id="score-ob" class="item-val font-mono">0</span>
+                                        </div>
+                                        <div class="breakdown-item">
+                                            <span class="item-lbl">CVD Div (20pt)</span>
+                                            <span id="score-cvd" class="item-val font-mono">0</span>
+                                        </div>
+                                        <div class="breakdown-item">
+                                            <span class="item-lbl">Momentum (15pt)</span>
+                                            <span id="score-mom" class="item-val font-mono">0</span>
+                                        </div>
+                                        <div class="breakdown-item">
+                                            <span class="item-lbl">FVG Mag (15pt)</span>
+                                            <span id="score-fvg" class="item-val font-mono">0</span>
+                                        </div>
+                                        <div class="breakdown-item">
+                                            <span class="item-lbl">Orderbook (10pt)</span>
+                                            <span id="score-book" class="item-val font-mono">0</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- COLUMN 2: SMC & MICROSTRUCTURE LEVELS GRID -->
+                        <div class="workspace-column flex-6">
+                            <div class="workspace-card levels-card">
+                                <h3 class="section-title"><i class="fa-solid fa-network-wired"></i> LIQUIDITY & MICROSTRUCTURE</h3>
+                                
+                                <div class="levels-container">
+                                    <!-- Value Area Profile Card -->
+                                    <div class="levels-subcard value-area-subcard">
+                                        <span class="card-subtitle-small">1H VOLUME PROFILE VALUE AREA</span>
+                                        <div class="va-display-bar">
+                                            <div class="va-track">
+                                                <div id="va-val-label" class="va-bound label-left font-mono">0.00</div>
+                                                <div class="va-area">
+                                                    <span class="va-area-label">Value Area (70% Volume)</span>
+                                                </div>
+                                                <div id="va-vah-label" class="va-bound label-right font-mono">0.00</div>
+                                            </div>
+                                            <div class="va-poc-indicator">
+                                                <span class="poc-label">POC: <span id="va-poc-val" class="font-mono">0.00</span></span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Split Grid: OBs and FVGs -->
+                                    <div class="levels-split-row">
+                                        <!-- Order Blocks -->
+                                        <div class="level-column">
+                                            <span class="card-subtitle-small">UNMITIGATED ORDER BLOCKS (OB)</span>
+                                            <div class="levels-box flex-column" id="val-ob-container">
+                                                <div class="box-message">No active unmitigated OBs in lookback.</div>
+                                            </div>
+                                        </div>
+                                        <!-- Fair Value Gaps -->
+                                        <div class="level-column">
+                                            <span class="card-subtitle-small">UNFILLED FAIR VALUE GAPS (FVG)</span>
+                                            <div class="levels-box flex-column" id="val-fvg-container">
+                                                <div class="box-message">No active unfilled FVGs in range.</div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Split Grid: S/R touches and CVD Absorption -->
+                                    <div class="levels-split-row">
+                                        <!-- Support & Resistance levels -->
+                                        <div class="level-column">
+                                            <span class="card-subtitle-small">TOUCH-WEIGHTED KEY LEVELS (S/R)</span>
+                                            <div class="levels-box flex-column" id="val-sr-container">
+                                                <div class="box-message">No historical S/R cluster zones.</div>
+                                            </div>
+                                        </div>
+                                        <!-- CVD Absorption Warnings -->
+                                        <div class="level-column">
+                                            <span class="card-subtitle-small">CVD MARKET ABSORPTION WARNINGS</span>
+                                            <div class="levels-box flex-column" id="val-cvd-container">
+                                                <div class="box-message">No active CVD absorption divergences.</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                    </section>
+
+                    <!-- BOTTOM WORKSPACE: AI NARRATIVE & HYPOTHETICAL IF-THEN SETUP -->
+                    <section class="bottom-workspace-row">
+                        
+                        <!-- Market Narrative Panel -->
+                        <div class="workspace-card narrative-card">
+                            <h3 class="section-title"><i class="fa-solid fa-message-quote"></i> NARRATIVE TRANSCRIPT</h3>
+                            <p id="val-market-narrative" class="narrative-text">
+                                No transcript generated yet.
+                            </p>
+                        </div>
+
+                        <!-- HYPOTHETICAL IF-THEN SETUP CARD -->
+                        <div id="hypothetical-setup-card" class="workspace-card hypothetical-card highlight-setup">
+                            <div class="hypo-header">
+                                <h3 class="section-title"><i class="fa-solid fa-shuffle-alt"></i> HYPOTHETICAL IF-THEN EXECUTION</h3>
+                                <span class="hypo-tag">UNCERTAIN MARKET COMPASS</span>
+                            </div>
+                            <div class="hypo-body">
+                                <div class="hypo-row">
+                                    <div class="hypo-col">
+                                        <span class="card-subtitle-small">MOST PROBABLE PRICE DIRECTION</span>
+                                        <h4 id="hypo-direction" class="hypo-value text-green">LONG</h4>
+                                    </div>
+                                    <div class="hypo-col">
+                                        <span class="card-subtitle-small">TRIGGER EVENT & CONDITION</span>
+                                        <p id="hypo-trigger" class="hypo-desc-text">Price pulls back to 15m bullish OB boundary X followed by engulfing close.</p>
+                                    </div>
+                                </div>
+                                <div class="hypo-row levels-row font-mono">
+                                    <div class="level-stat">
+                                        <span class="stat-lbl">ENTRY</span>
+                                        <span id="hypo-entry" class="stat-val text-white">0.00</span>
+                                    </div>
+                                    <div class="level-stat">
+                                        <span class="stat-lbl">INVALIDATION (SL)</span>
+                                        <span id="hypo-sl" class="stat-val text-red">0.00</span>
+                                    </div>
+                                    <div class="level-stat">
+                                        <span class="stat-lbl">TARGET (TP)</span>
+                                        <span id="hypo-tp" class="stat-val text-green">0.00</span>
+                                    </div>
+                                </div>
+                                <div class="hypo-row">
+                                    <div class="hypo-col">
+                                        <span class="card-subtitle-small">SUPPORTING CONFLUENCE EVIDENCE</span>
+                                        <p id="hypo-evidence" class="hypo-desc-text-small">Confluence of key orderbook delta absorption and unfilled bullish FVG fills.</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Technical Bullet Reasoning Panel -->
+                        <div class="workspace-card reasoning-card">
+                            <h3 class="section-title"><i class="fa-solid fa-brain-circuit"></i> AI REASONING STRUCTURE</h3>
+                            <div class="reasoning-bullets">
+                                <div class="bullet-item">
+                                    <div class="bullet-bullet"><i class="fa-solid fa-chevron-right"></i></div>
+                                    <div class="bullet-text"><strong>Structure:</strong> <span id="reasoning-struct">N/A</span></div>
+                                </div>
+                                <div class="bullet-item">
+                                    <div class="bullet-bullet"><i class="fa-solid fa-chevron-right"></i></div>
+                                    <div class="bullet-text"><strong>Liquidity & Volume:</strong> <span id="reasoning-liq">N/A</span></div>
+                                </div>
+                                <div class="bullet-item">
+                                    <div class="bullet-bullet"><i class="fa-solid fa-chevron-right"></i></div>
+                                    <div class="bullet-text"><strong>Momentum & Absorption:</strong> <span id="reasoning-mom">N/A</span></div>
+                                </div>
+                                <div class="bullet-item">
+                                    <div class="bullet-bullet"><i class="fa-solid fa-chevron-right"></i></div>
+                                    <div class="bullet-text"><strong>Orderbook & Sentiment:</strong> <span id="reasoning-book">N/A</span></div>
+                                </div>
+                            </div>
+                        </div>
+
+                    </section>
+                </div>
+
+            </main>
+        </div>
+    </div>
+
+    <!-- Client-Side Dashboard Controller Javascript -->
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
