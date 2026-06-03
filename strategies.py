@@ -250,7 +250,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, smc
     bo = detect_breakout(df_15m, smc_context)
     div = detect_divergence(df_15m, smc_context)
 
-    # Momentum, orderbook, sentiment and funding
+    # Momentum, orderbook, sentiment and funding (non-blocking for SMC)
     momentum_ok = (
         (trend == "bullish" and latest_15m["RSI"] < 65 and latest_15m["MACD"] > latest_15m["MACD_SIGNAL"])
         or (trend == "bearish" and latest_15m["RSI"] > 35 and latest_15m["MACD"] < latest_15m["MACD_SIGNAL"])
@@ -265,11 +265,30 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, smc
     
     strategy_triggered = (trend == "bullish" and strategy_bullish) or (trend == "bearish" and strategy_bearish)
 
-    # Final setup is ready if we have a sweep + displacement confluences OR a strong sub-strategy trigger
+    # Final setup is ready if we have a sweep + displacement confluences OR a strong sub-strategy trigger (purely SMC)
     final_setup_ready = (
-        (sweep and displacement and momentum_ok and book_ok and sentiment_ok and funding_ok)
-        or (strategy_triggered and book_ok and sentiment_ok and funding_ok)
+        (sweep and displacement and momentum_ok)
+        or (strategy_triggered)
     )
+
+    # === CVD DIVERGENCE DETECTION ===
+    cvd_div = False
+    if "cvd" in df_15m.columns and len(df_15m) >= 10:
+        recent_10 = df_15m.tail(10)
+        price_start = float(recent_10["close"].iloc[0])
+        price_end = float(recent_10["close"].iloc[-1])
+        cvd_vals = recent_10["cvd"].dropna().tolist()
+        if len(cvd_vals) >= 2:
+            cvd_start = cvd_vals[0]
+            cvd_end = cvd_vals[-1]
+            if trend == "bullish":
+                # Bullish absorption: price down, CVD up
+                if price_end < price_start and cvd_end > cvd_start:
+                    cvd_div = True
+            else:
+                # Bearish absorption: price up, CVD down
+                if price_end > price_start and cvd_end < cvd_start:
+                    cvd_div = True
 
     # === CONFLUENCE SCORE MATRIX (0-100) ===
     score_breakdown = {
@@ -278,12 +297,11 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, smc
         "liquidity_sweep": 0,
         "momentum": 0,
         "fvg_magnet": 0,
-        "orderbook_funding": 0,
-        "ote_bonus": 0
+        "ote_bonus": 0,
+        "cvd_divergence": 0
     }
     
     # 1. Trend Alignment (Max 20)
-    # Only award 20 points if Trend AND Structure AND EMA agree; 0 points if they conflict.
     ema_50_15m = float(latest_15m["EMA_50"]) if "EMA_50" in latest_15m else current_price
     struct_1h = smc_context.get("1h", {}).get("structure", "NEUTRAL") if smc_context else "NEUTRAL"
     
@@ -342,22 +360,18 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, smc
                 if 0 <= dist <= 0.01:
                     has_fvg_magnet = True
     if has_fvg_magnet:
-        score_breakdown["fvg_magnet"] = 20
+        score_breakdown["fvg_magnet"] = 15
         
-    # 6. Orderbook & Funding (Max 10)
-    ob_fund_points = 0
-    if book_ok:
-        ob_fund_points += 5
-    if funding_ok:
-        ob_fund_points += 5
-    score_breakdown["orderbook_funding"] = ob_fund_points
-    
-    # 7. OTE Zone Bonus (Max 10)
+    # 6. OTE Zone Bonus (Max 10)
     in_ote = False
     if smc_context and "15m" in smc_context:
         in_ote = smc_context["15m"].get("premium_discount", {}).get("in_ote", False)
     if in_ote:
         score_breakdown["ote_bonus"] = 10
+
+    # 7. CVD Divergence (Max 10)
+    if cvd_div:
+        score_breakdown["cvd_divergence"] = 10
         
     total_score = min(100, sum(score_breakdown.values()))
 

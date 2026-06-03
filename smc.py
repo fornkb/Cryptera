@@ -7,12 +7,15 @@ import numpy as np
 
 def find_swings(df: pd.DataFrame, left=5, right=5):
     """
-    Find swing highs and swing lows without lookahead lag on the latest closed candle.
-    Returns the last 5 swing highs and swing lows as list of (timestamp, price) tuples.
+    Find swing highs and swing lows. Uses standard left/right confirmation,
+    but also scans the latest unconfirmed candles for volume climaxes and wick rejections
+    to identify "developing" swings with zero lookahead lag.
     """
     swing_highs = []
     swing_lows = []
     n = len(df)
+    if n < 10:
+        return [], []
     
     # We must scan up to n - right to avoid lookahead on unconfirmed candles
     for i in range(left, n - right):
@@ -41,6 +44,33 @@ def find_swings(df: pd.DataFrame, left=5, right=5):
             ts_str = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
             swing_lows.append((ts_str, float(val_low)))
             
+    # --- DEVELOPING / VOL-CLIMAX SWINGS (ZERO LAG) ---
+    atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else (df['high'] - df['low']).mean()
+    vol_mean = df['volume'].rolling(20).mean().iloc[-1] if len(df) >= 20 else df['volume'].mean()
+
+    for idx in range(n - right, n):
+        if idx < 0 or idx >= n:
+            continue
+        c = df.iloc[idx]
+        high, low, open_p, close = float(c['high']), float(c['low']), float(c['open']), float(c['close'])
+        vol = float(c['volume'])
+        body = abs(close - open_p)
+        
+        upper_wick = high - max(open_p, close)
+        lower_wick = min(open_p, close) - low
+        
+        ts_str = c['timestamp'].isoformat() if hasattr(c['timestamp'], 'isoformat') else str(c['timestamp'])
+        
+        # 1. Bearish Rejection (Potential Swing High)
+        if upper_wick > body * 1.2 and upper_wick > atr * 0.4 and vol > vol_mean * 1.1:
+            if not swing_highs or swing_highs[-1][0] != ts_str:
+                swing_highs.append((ts_str, high))
+                
+        # 2. Bullish Rejection (Potential Swing Low)
+        if lower_wick > body * 1.2 and lower_wick > atr * 0.4 and vol > vol_mean * 1.1:
+            if not swing_lows or swing_lows[-1][0] != ts_str:
+                swing_lows.append((ts_str, low))
+                
     return swing_highs[-5:], swing_lows[-5:]
 
 def get_market_structure(swing_highs, swing_lows, df=None):

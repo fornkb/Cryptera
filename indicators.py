@@ -12,23 +12,8 @@ def calculate_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFram
     df = df.sort_values("timestamp").reset_index(drop=True)
 
     # === TREND ===
-    df["EMA_8"] = ta.ema(df["close"], length=8)
-    df["EMA_20"] = ta.ema(df["close"], length=20)
     df["EMA_50"] = ta.ema(df["close"], length=50)
     df["EMA_200"] = ta.ema(df["close"], length=200)
-
-    # === VWAP (Volume Weighted Average Price) ===
-    try:
-        # VWAP requires an ordered DatetimeIndex to avoid warnings/errors in pandas-ta
-        df_temp = df.copy()
-        df_temp.index = pd.to_datetime(df_temp["timestamp"])
-        vwap_series = ta.vwap(df_temp["high"], df_temp["low"], df_temp["close"], df_temp["volume"])
-        if vwap_series is not None:
-            df["VWAP"] = vwap_series.values
-        else:
-            df["VWAP"] = np.nan
-    except Exception:
-        df["VWAP"] = np.nan
 
     # === VOLATILITY ===
     df["ATR"] = ta.atr(df["high"], df["low"], df["close"], length=14)
@@ -47,10 +32,51 @@ def calculate_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFram
         df["MACD_SIGNAL"] = np.nan
 
     # === VOLUME ===
-    df["OBV"] = ta.obv(df["close"], df["volume"])
     vol_mean = df["volume"].rolling(20).mean()
     vol_std = df["volume"].rolling(20).std()
     df["VOL_Z"] = (df["volume"] - vol_mean) / vol_std
+
+    # === SUPERTREND ===
+    try:
+        st = ta.supertrend(df["high"], df["low"], df["close"], length=10, multiplier=3.0)
+        if st is not None:
+            # columns in pandas_ta supertrend: SUPERT_10_3.0, SUPERTd_10_3.0, SUPERTl_10_3.0, SUPERTs_10_3.0
+            df["SUPERT_10_3.0"] = st["SUPERT_10_3.0"]
+            df["SUPERTd_10_3.0"] = st["SUPERTd_10_3.0"]
+        else:
+            df["SUPERT_10_3.0"] = np.nan
+            df["SUPERTd_10_3.0"] = np.nan
+    except Exception:
+        df["SUPERT_10_3.0"] = np.nan
+        df["SUPERTd_10_3.0"] = np.nan
+
+    # === STOCHASTIC RSI ===
+    try:
+        stochrsi = ta.stochrsi(df["close"], length=14, rsi_length=14, k=3, d=3)
+        if stochrsi is not None:
+            df["STOCHRSIk_14_14_3_3"] = stochrsi["STOCHRSIk_14_14_3_3"]
+            df["STOCHRSId_14_14_3_3"] = stochrsi["STOCHRSId_14_14_3_3"]
+        else:
+            df["STOCHRSIk_14_14_3_3"] = np.nan
+            df["STOCHRSId_14_14_3_3"] = np.nan
+    except Exception:
+        df["STOCHRSIk_14_14_3_3"] = np.nan
+        df["STOCHRSId_14_14_3_3"] = np.nan
+
+    # === ADX ===
+    try:
+        adx = ta.adx(df["high"], df["low"], df["close"], length=14)
+        if adx is not None:
+            df["ADX"] = adx["ADX_14"]
+        else:
+            df["ADX"] = np.nan
+    except Exception:
+        df["ADX"] = np.nan
+
+    # === CVD PROXY ===
+    range_val = df["high"] - df["low"]
+    multiplier = np.where(range_val > 0, ((df["close"] - df["low"]) - (df["high"] - df["close"])) / range_val, 0.0)
+    df["cvd"] = (df["volume"] * multiplier).cumsum()
 
     # === SWING POINTS (Historical / Liquidity Pools) ===
     df["swing_high"] = df["high"] == df["high"].rolling(5, center=True).max()

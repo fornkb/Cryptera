@@ -40,11 +40,8 @@ def run():
     print(f"[API] Starting live market analysis for: {symbol}")
     
     try:
-        # Run the async analysis synchronously inside Flask's thread using asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        snapshot, narration = loop.run_until_complete(run_analysis(symbol))
-        loop.close()
+        # Run the async analysis synchronously inside Flask's thread using standard asyncio.run()
+        snapshot, narration = asyncio.run(run_analysis(symbol))
         
         return jsonify({
             "success": True,

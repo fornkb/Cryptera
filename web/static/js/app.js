@@ -236,30 +236,32 @@ document.addEventListener("DOMContentLoaded", () => {
             const bear_ob_1h = smc_1h.order_blocks?.bearish?.[0];
             const bull_ob_15m = smc_15m.order_blocks?.bullish?.[0];
             const bear_ob_15m = smc_15m.order_blocks?.bearish?.[0];
+                        // Entry level: prefer local 15m OB or current price to stay close
+            const nearest_ob = bias === "BULLISH" ? (bull_ob_15m || bull_ob_1h) : (bear_ob_15m || bear_ob_1h);
+            valEntry.textContent = nearest_ob ? nearest_ob.top.toFixed(2) : price.toFixed(2);
             
-            const ob_range = bias === "BULLISH" 
-                ? (bull_ob_1h || bull_ob_15m)
-                : (bear_ob_1h || bear_ob_15m);
-            valEntry.textContent = ob_range ? ob_range.top.toFixed(2) : price.toFixed(2);
-            
-            // Stop Loss placement calculated from 1H and 15m data (safer/more conservative level)
-            const sl_1h = bias === "BULLISH"
-                ? (smc_1h.liquidity_levels?.sell_side?.[0] || smc_1h.current_price * 0.99)
-                : (smc_1h.liquidity_levels?.buy_side?.[0] || smc_1h.current_price * 1.01);
-            const sl_15m = bias === "BULLISH"
-                ? (smc_15m.liquidity_levels?.sell_side?.[0] || smc_15m.current_price * 0.99)
-                : (smc_15m.liquidity_levels?.buy_side?.[0] || smc_15m.current_price * 1.01);
-            
+            // Stop Loss placement: local 15m swing low/high for high-precision tight stops (close to price)
             const sl_val = bias === "BULLISH"
-                ? Math.min(sl_1h, sl_15m)
-                : Math.max(sl_1h, sl_15m);
+                ? (smc_15m.liquidity_levels?.sell_side?.[0] || price * 0.992)
+                : (smc_15m.liquidity_levels?.buy_side?.[0] || price * 1.008);
             valStopLoss.textContent = sl_val.toFixed(2);
             
-            // Take Profit placement targeting key levels from 4H
-            const tp_4h = bias === "BULLISH"
-                ? (smc_4h.liquidity_levels?.buy_side?.[0] || price * 1.02)
-                : (smc_4h.liquidity_levels?.sell_side?.[0] || price * 0.98);
-            valTakeProfit.textContent = tp_4h.toFixed(2);
+            // Take Profit: local targets satisfying 1:2 RR
+            const entryPrice = parseFloat(valEntry.textContent);
+            const stopPrice = parseFloat(valStopLoss.textContent);
+            const risk = Math.abs(entryPrice - stopPrice);
+            
+            let tp_val = bias === "BULLISH"
+                ? (smc_15m.liquidity_levels?.buy_side?.[0] || entryPrice + 2 * risk)
+                : (smc_15m.liquidity_levels?.sell_side?.[0] || entryPrice - 2 * risk);
+                
+            // Mathematically enforce 1:2 minimum risk reward
+            if (bias === "BULLISH" && tp_val < entryPrice + 2 * risk) {
+                tp_val = entryPrice + 2 * risk;
+            } else if (bias === "BEARISH" && tp_val > entryPrice - 2 * risk) {
+                tp_val = entryPrice - 2 * risk;
+            }
+            valTakeProfit.textContent = tp_val.toFixed(2);
         }
         
         // 4. Value Area bounds (1H)
