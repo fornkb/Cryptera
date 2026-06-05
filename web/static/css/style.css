@@ -701,9 +701,32 @@ select:focus, input[type="text"]:focus {
 .bg-bullish, .bg-buy { background: rgba(16, 185, 129, 0.15); color: var(--color-accent-emerald); border: 1px solid rgba(16, 185, 129, 0.3); box-shadow: var(--neon-glow-emerald); }
 .bg-bearish, .bg-sell { background: rgba(239, 68, 68, 0.15); color: var(--color-accent-crimson); border: 1px solid rgba(239, 68, 68, 0.3); box-shadow: var(--neon-glow-crimson); }
 .bg-amber, .bg-hold { background: rgba(245, 158, 11, 0.15); color: var(--color-accent-amber); border: 1px solid rgba(245, 158, 11, 0.3); }
+.bg-warning { background: rgba(245, 158, 11, 0.2); color: var(--color-accent-amber); border: 1px solid rgba(245, 158, 11, 0.4); }
 
 .text-green { color: var(--color-accent-emerald); }
 .text-red { color: var(--color-accent-crimson); }
+.text-white { color: #ffffff; }
+
+.hvn-tag {
+    display: inline-block;
+    background: rgba(99, 102, 241, 0.18);
+    color: #c4b5fd;
+    border: 1px solid rgba(99, 102, 241, 0.4);
+    border-radius: 3px;
+    padding: 0 4px;
+    font-size: 9px;
+    margin-left: 4px;
+    text-transform: uppercase;
+}
+
+.narrative-secondary {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    font-size: 11px;
+    color: var(--color-text-muted);
+}
+.narrative-secondary strong { color: var(--color-text-primary); }
 
 .score-breakdown-wrapper {
     background: rgba(0, 0, 0, 0.15);
