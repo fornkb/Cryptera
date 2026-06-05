@@ -12,8 +12,12 @@ terminal.
   override paths).
 * Broken `forceOrders` liquidations call removed; prompt rules pruned to
   match.
-* Gemini now returns **structured JSON** (`response_mime_type=application/json`)
-  and the response is persisted into the snapshot file under `analysis`.
+* Gemini now returns **structured JSON** enforced by `response_schema`
+  (Gemini 3.5 Flash). The response is persisted into the snapshot file
+  under `analysis`. Thinking depth is controlled via `thinking_level`
+  (`minimal`/`low`/`medium`/`high`), defaulting to `medium`. Deprecated
+  sampling knobs (`temperature`, `top_p`, `top_k`, `candidate_count`) are
+  no longer sent — 3.x is tuned for its own defaults.
 * ATR-normalised thresholds for OB / FVG / S/R / HVN — adaptive across
   assets and volatility regimes.
 * L2 order-book depth bins (±0.25/0.5/1/2%), per-band imbalance.
@@ -36,7 +40,7 @@ terminal.
 * numpy
 * requests
 * python-dotenv
-* google-generativeai
+* google-genai (new SDK — `from google import genai`)
 * Flask
 
 ## Installation

@@ -13,7 +13,8 @@ import numpy as np
 from collections import OrderedDict
 from datetime import datetime
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 
 from indicators import calculate_indicators, detect_regime, detect_volatility_regime
 from strategies import evaluate_strategies
@@ -412,142 +413,292 @@ def fetch_event_window(now_ts: float = None, window_hours: int = 2) -> dict:
 # ---------------- Gemini ---------------- #
 
 GEMINI_SYSTEM_INSTRUCTION = """
-You are an Elite Institutional Trading System (ICT/SMC). Output a STRICTLY VALID JSON trade decision derived from the supplied market snapshot. No preamble, no markdown, no comments outside the JSON.
+ICT/SMC institutional trade engine. Return a JSON object matching the enforced schema.
 
-ABSOLUTE GROUNDING RULES
-1. Use ONLY exact numbers present in the snapshot. Never invent price levels, swing points, OBs, FVGs or VA bounds.
-2. The snapshot's `strategies.confluence_breakdown` already mirrors the C1-C8 rubric below. Treat it as the authoritative score. Only override if a specific factual error exists; otherwise echo it.
-3. Risk-reward: enforce min 1:2. Verify mathematically and report distances.
-4. SL within 0.5%-1.5% of entry; entry close to current 15m structure (OB / FVG edge / current price). No far-away macro entries.
-5. Output MUST be a single JSON object matching the schema below. No leading text.
+Rules
+1. Use only numbers present in the snapshot. Never invent levels.
+2. `strategies.confluence_breakdown` is authoritative. Echo it; only set `header.score_override` if a specific factual error in the pre-computed score is found.
+3. Min 1:2 R:R. SL within 0.5%-1.5% of entry. Entry at or near current 15m OB/FVG edge or current price.
 
-SCORING RUBRIC (already pre-computed — verify, do not recompute unless wrong):
- C1 trend_alignment   max 25 — ADX-tiered on agreement of 4H/1H structure; +10 base on conflict
- C2 ob_proximity      max 15 — tiered 0/5/10/15 by distance to 15m or 1H OB/FVG edge
- C3 liquidity_sweep   max 10 — binary
- C4 momentum          max 15 — base 10 if 1H RSI/MACD aligns with bias, +/-5 RSI slope
- C5 fvg_magnet        max 15 — unfilled draw-on-liquidity FVG within 3% on 1H or 4H
- C6 ote_bonus         max 10 — in_ote on 1H or 4H
- C7 cvd_alignment     max 10 — 2+ TF CVD signs match bias; 0 if 15m diverges from 4H (absorption)
- C8 stochrsi          max  5 — overbought (sell) / oversold (buy) on 1H
+Scoring rubric (already computed in snapshot)
+ C1 trend (25)        ADX-tiered when 4H/1H agree; +10 base on conflict
+ C2 ob_prox (15)      0/5/10/15 by distance to nearest 15m or 1H OB/FVG edge
+ C3 sweep (10)        binary sweep+reclaim of a swing pool
+ C4 momentum (15)     +10 if 1H RSI/MACD aligns; +/-5 RSI slope
+ C5 fvg_magnet (15)   unfilled FVG within 3% on 1H or 4H
+ C6 ote (10)          in_ote on 1H or 4H
+ C7 cvd (10)          2+ TF CVD signs match bias; 0 if 15m opposes 4H
+ C8 stoch (5)         1H StochRSI overbought (sell) / oversold (buy)
 
-THRESHOLDS
-  score >= 60        ACTIVE_TRADE  (still subject to volume gate)
-  score 45 - 59      CONDITIONAL_ENTRY
-  score < 45         HOLD
+Thresholds
+ score >= 60 → ACTIVE_TRADE   45-59 → CONDITIONAL_ENTRY   < 45 → HOLD
 
-VOLUME GATE (from strategies.volume_gate.state)
-  HARD_GATE          execution suspended regardless of score; action = HOLD
-  LOW_VOL_WARNING    reduce position size to 50%; require +1 confluence factor
-  CLEAR              no penalty
+Gates
+ volume_gate.HARD_GATE        → force HOLD regardless of score
+ volume_gate.LOW_VOL_WARNING  → position_size = "50% low-vol"; require +1 confluence
+ event_guard.active == true   → cap action at CONDITIONAL_ENTRY; reduce confidence by 15
+ 4H/1H conflict               → follow 4H; cite as risk
+ 15m diverges 1H              → counter_structure = true; require 15m CHoCH/BOS
+ cvd_absorption_warning       → reduce confidence by 10; cite explicitly
 
-EVENT GUARD
-  If event_guard.active == true: cap action at CONDITIONAL_ENTRY and reduce confidence by 15.
+Action-specific filling
+ HOLD               → trade_decision entry/stop_loss/take_profit/rr.* = null. Forward scenario filled.
+ CONDITIONAL_ENTRY  → trade_decision numeric; entry_trigger states the exact required condition.
+ ACTIVE_TRADE       → trade_decision fully numeric; rr.passed must be true.
 
-CONFLICT HANDLING
-  4H/1H conflict      follow 4H direction; cite conflict as a risk factor
-  15m diverges 1H     flag counter_structure=true; require 15m CHoCH/BOS trigger before entry
-  CVD absorption      (strategies.cvd_absorption_warning == true) reduce confidence by 10, note explicitly
-
-OUTPUT JSON SCHEMA (every field required, fill with snapshot values; use null only where explicitly allowed):
-{
-  "header": {
-    "pair": "<symbol>",
-    "price": <number>,
-    "bias": "BULLISH" | "BEARISH" | "NEUTRAL",
-    "regime": "<market_regime>",
-    "score": <int 0-100>,
-    "action": "ACTIVE_TRADE" | "CONDITIONAL_ENTRY" | "HOLD",
-    "volume_gate": "HARD_GATE" | "LOW_VOL_WARNING" | "CLEAR",
-    "score_breakdown": {
-      "c1_trend": <int>, "c2_ob_prox": <int>, "c3_sweep": <int>,
-      "c4_momentum": <int>, "c5_fvg_magnet": <int>, "c6_ote": <int>,
-      "c7_cvd": <int>, "c8_stoch": <int>
-    },
-    "score_override": null
-  },
-  "mtf_context": {
-    "h4":  {"structure": "<str>", "bos": "<str|NONE>", "adx": <num>, "adx_tier": "WEAK|MEDIUM|STRONG|VERY_STRONG", "cvd_delta": <num>, "price_change_pct": <num>, "pd_zone": "premium|discount|neutral", "in_ote": <bool>, "nearest_ob": "<str|NONE>", "nearest_fvg": "<str|NONE>"},
-    "h1":  {"structure": "<str>", "bos": "<str|NONE>", "adx": <num>, "rsi": <num>, "rsi_slope": <num>, "stochrsi_k": <num>, "cvd_delta": <num>, "price_change_pct": <num>, "pd_zone": "premium|discount|neutral", "in_ote": <bool>, "nearest_ob": "<str|NONE>", "nearest_fvg": "<str|NONE>"},
-    "m15": {"structure": "<str>", "rel_volume": <num>, "candle_pattern": "<str>", "cvd_delta": <num>, "price_change_pct": <num>, "pd_zone": "premium|discount|neutral", "in_ote": <bool>, "nearest_ob": "<str|NONE>", "nearest_fvg": "<str|NONE>"},
-    "cross_tf_momentum": "<one short sentence comparing 4h/1h/15m price-change directions>"
-  },
-  "narrative": {
-    "summary": "<<=2 sentences MTF flow + VA positioning + CVD alignment>",
-    "primary_draw": "<which liquidity pool or FVG is the next draw on price>"
-  },
-  "trade_decision": {
-    "primary":     {"direction": "BUY"|"SELL"|"HOLD", "probability": <int 0-100>},
-    "alternative": {"direction": "BUY"|"SELL"|"HOLD", "probability": <int 0-100>, "trigger": "<exact condition>"},
-    "entry": <number|null>,
-    "entry_source": "<e.g. '15m bear FVG top'>",
-    "stop_loss": <number|null>,
-    "stop_loss_source": "<e.g. '15m swing high'>",
-    "take_profit": <number|null>,
-    "take_profit_source": "<e.g. 'SSL @ 66193'>",
-    "rr": {"tp_distance": <num>, "sl_distance": <num>, "ratio": <num>, "passed": <bool>},
-    "sl_width_pct": <num>,
-    "confidence_pct": <int 0-100>,
-    "position_size": "<'100%' | '50% low-vol' | '25% cascade' | 'reduced — conflict'>",
-    "entry_trigger": "<exact condition required for entry>",
-    "invalidation": "<exact condition that voids the setup>",
-    "counter_structure": <bool>,
-    "reasoning": {
-      "structure": "<one sentence ADX tier + multi-TF structure>",
-      "liquidity": "<one sentence VAH/VAL/swept pools/rel_vol/OI>",
-      "momentum":  "<one sentence RSI+slope, StochRSI, CVD all 3 TFs>",
-      "sentiment": "<one sentence orderbook depth bins + funding trajectory + F&G>"
-    }
-  },
-  "forward_scenario": {
-    "direction": "LONG" | "SHORT" | "NEUTRAL",
-    "key_levels": {
-      "h4":  ["<level + label>", ...],
-      "h1":  ["<level + label>", ...],
-      "m15": ["<level + label>", ...]
-    },
-    "trigger":           "<exact contingent event>",
-    "entry":             <number|null>,
-    "stop_loss":         <number|null>,
-    "take_profit":       <number|null>,
-    "rr":                <num>,
-    "volume_condition":  "<rel_vol gate requirement>",
-    "supporting_confluence": "<<=2 sentences citing exact snapshot values>"
-  }
-}
-
-If action == "HOLD", set entry/stop_loss/take_profit/rr to null in trade_decision but still fill forward_scenario completely.
+Field formats
+ mtf_context.<tf>.nearest_ob / nearest_fvg : "<low>-<high>" or "NONE".
+ forward_scenario.key_levels.<tf> : ["<price> — <label>", ...] sourced from snapshot.
+ narrative.summary : ≤ 2 sentences.
 """.strip()
 
 
-def query_gemini(snapshot: dict) -> dict:
-    """Call Gemini with response_mime_type=application/json and return parsed dict."""
+GEMINI_MODEL_NAME = "gemini-3.5-flash"
+# Gemini 3.5 uses string-enum thinking levels instead of numeric budgets.
+# minimal | low | medium (default) | high. `medium` is the sweet spot for C1-C8
+# verification — high adds ~30% latency for marginal lift on rule-following tasks.
+GEMINI_THINKING_LEVEL = "high"
+
+_INT = {"type": "integer"}
+_NUM = {"type": "number"}
+_STR = {"type": "string"}
+_BOOL = {"type": "boolean"}
+_NUM_NULL = {"type": "number", "nullable": True}
+_STR_ARR = {"type": "array", "items": _STR}
+
+
+def _tf_schema(extra_props: dict, extra_required: list) -> dict:
+    """Common per-timeframe schema with optional extras stacked on top."""
+    base_props = {
+        "structure": _STR,
+        "bos": _STR,
+        "cvd_delta": _NUM,
+        "price_change_pct": _NUM,
+        "pd_zone": {"type": "string", "enum": ["premium", "discount", "neutral"]},
+        "in_ote": _BOOL,
+        "nearest_ob": _STR,
+        "nearest_fvg": _STR,
+    }
+    base_required = ["structure", "cvd_delta", "price_change_pct", "pd_zone",
+                     "in_ote", "nearest_ob", "nearest_fvg"]
+    return {
+        "type": "object",
+        "properties": {**base_props, **extra_props},
+        "required": base_required + extra_required,
+    }
+
+
+GEMINI_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "header": {
+            "type": "object",
+            "properties": {
+                "pair": _STR,
+                "price": _NUM,
+                "bias": {"type": "string", "enum": ["BULLISH", "BEARISH", "NEUTRAL"]},
+                "regime": _STR,
+                "score": _INT,
+                "action": {"type": "string", "enum": ["ACTIVE_TRADE", "CONDITIONAL_ENTRY", "HOLD"]},
+                "volume_gate": {"type": "string", "enum": ["HARD_GATE", "LOW_VOL_WARNING", "CLEAR"]},
+                "score_breakdown": {
+                    "type": "object",
+                    "properties": {
+                        "c1_trend": _INT, "c2_ob_prox": _INT, "c3_sweep": _INT,
+                        "c4_momentum": _INT, "c5_fvg_magnet": _INT, "c6_ote": _INT,
+                        "c7_cvd": _INT, "c8_stoch": _INT,
+                    },
+                    "required": ["c1_trend", "c2_ob_prox", "c3_sweep", "c4_momentum",
+                                 "c5_fvg_magnet", "c6_ote", "c7_cvd", "c8_stoch"],
+                },
+                "score_override": {
+                    "type": "object",
+                    "nullable": True,
+                    "properties": {
+                        "from": _INT,
+                        "to": _INT,
+                        "reason": _STR,
+                    },
+                },
+            },
+            "required": ["pair", "price", "bias", "regime", "score", "action",
+                         "volume_gate", "score_breakdown"],
+        },
+        "mtf_context": {
+            "type": "object",
+            "properties": {
+                "h4": _tf_schema(
+                    {"adx": _NUM,
+                     "adx_tier": {"type": "string", "enum": ["WEAK", "MEDIUM", "STRONG", "VERY_STRONG"]}},
+                    ["adx", "adx_tier", "bos"],
+                ),
+                "h1": _tf_schema(
+                    {"adx": _NUM, "rsi": _NUM, "rsi_slope": _NUM, "stochrsi_k": _NUM},
+                    ["adx", "rsi", "rsi_slope", "stochrsi_k", "bos"],
+                ),
+                "m15": _tf_schema(
+                    {"rel_volume": _NUM, "candle_pattern": _STR},
+                    ["rel_volume", "candle_pattern"],
+                ),
+                "cross_tf_momentum": _STR,
+            },
+            "required": ["h4", "h1", "m15", "cross_tf_momentum"],
+        },
+        "narrative": {
+            "type": "object",
+            "properties": {
+                "summary": _STR,
+                "primary_draw": _STR,
+            },
+            "required": ["summary", "primary_draw"],
+        },
+        "trade_decision": {
+            "type": "object",
+            "properties": {
+                "primary": {
+                    "type": "object",
+                    "properties": {
+                        "direction": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
+                        "probability": _INT,
+                    },
+                    "required": ["direction", "probability"],
+                },
+                "alternative": {
+                    "type": "object",
+                    "properties": {
+                        "direction": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
+                        "probability": _INT,
+                        "trigger": _STR,
+                    },
+                    "required": ["direction", "probability", "trigger"],
+                },
+                "entry": _NUM_NULL,
+                "entry_source": _STR,
+                "stop_loss": _NUM_NULL,
+                "stop_loss_source": _STR,
+                "take_profit": _NUM_NULL,
+                "take_profit_source": _STR,
+                "rr": {
+                    "type": "object",
+                    "properties": {
+                        "tp_distance": _NUM_NULL,
+                        "sl_distance": _NUM_NULL,
+                        "ratio": _NUM_NULL,
+                        "passed": _BOOL,
+                    },
+                    "required": ["tp_distance", "sl_distance", "ratio", "passed"],
+                },
+                "sl_width_pct": _NUM_NULL,
+                "confidence_pct": _INT,
+                "position_size": {
+                    "type": "string",
+                    "enum": ["100%", "50% low-vol", "25% cascade", "reduced - conflict"],
+                },
+                "entry_trigger": _STR,
+                "invalidation": _STR,
+                "counter_structure": _BOOL,
+                "reasoning": {
+                    "type": "object",
+                    "properties": {
+                        "structure": _STR,
+                        "liquidity": _STR,
+                        "momentum": _STR,
+                        "sentiment": _STR,
+                    },
+                    "required": ["structure", "liquidity", "momentum", "sentiment"],
+                },
+            },
+            "required": ["primary", "alternative", "entry", "entry_source",
+                         "stop_loss", "stop_loss_source", "take_profit", "take_profit_source",
+                         "rr", "sl_width_pct", "confidence_pct", "position_size",
+                         "entry_trigger", "invalidation", "counter_structure", "reasoning"],
+        },
+        "forward_scenario": {
+            "type": "object",
+            "properties": {
+                "direction": {"type": "string", "enum": ["LONG", "SHORT", "NEUTRAL"]},
+                "key_levels": {
+                    "type": "object",
+                    "properties": {"h4": _STR_ARR, "h1": _STR_ARR, "m15": _STR_ARR},
+                    "required": ["h4", "h1", "m15"],
+                },
+                "trigger": _STR,
+                "entry": _NUM_NULL,
+                "stop_loss": _NUM_NULL,
+                "take_profit": _NUM_NULL,
+                "rr": _NUM_NULL,
+                "volume_condition": _STR,
+                "supporting_confluence": _STR,
+            },
+            "required": ["direction", "key_levels", "trigger", "entry", "stop_loss",
+                         "take_profit", "rr", "volume_condition", "supporting_confluence"],
+        },
+    },
+    "required": ["header", "mtf_context", "narrative", "trade_decision", "forward_scenario"],
+}
+
+
+# Module-level lazy client. `google-genai` clients are reusable across calls,
+# so we build one on first use and keep it.
+_GENAI_CLIENT: "genai.Client | None" = None
+
+
+def _get_genai_client() -> "genai.Client":
+    global _GENAI_CLIENT
+    if _GENAI_CLIENT is not None:
+        return _GENAI_CLIENT
     load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return {"error": "GEMINI_API_KEY not set"}
+        raise RuntimeError("GEMINI_API_KEY not set")
+    _GENAI_CLIENT = genai.Client(api_key=api_key)
+    return _GENAI_CLIENT
 
-    genai.configure(api_key=api_key, transport="rest")
-    generation_config = {
+
+def _build_generate_config(include_schema: bool = True) -> "genai_types.GenerateContentConfig":
+    """
+    GenerateContentConfig for Gemini 3.5 Flash:
+      * `system_instruction` lives inside the config in the new SDK.
+      * `response_mime_type` + `response_schema` enforce JSON shape.
+      * `thinking_config.thinking_level` replaces the deprecated numeric budget.
+      * Sampling knobs (temperature/top_p/top_k/candidate_count) are
+        deliberately omitted — 3.x is tuned for its own defaults and the docs
+        warn against forced sampling for rule-following tasks.
+    """
+    kwargs = {
+        "system_instruction": GEMINI_SYSTEM_INSTRUCTION,
         "response_mime_type": "application/json",
-        "temperature": 0.2,
+        "thinking_config": genai_types.ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL),
     }
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        system_instruction=GEMINI_SYSTEM_INSTRUCTION,
-        generation_config=generation_config,
-    )
-    prompt = f"DATA SNAPSHOT:\n{json.dumps(snapshot, indent=2)}"
-    try:
-        raw = model.generate_content(prompt).text
-    except Exception as e:
-        return {"error": f"Gemini call failed: {e}"}
+    if include_schema:
+        kwargs["response_schema"] = GEMINI_RESPONSE_SCHEMA
+    return genai_types.GenerateContentConfig(**kwargs)
+
+
+def _extract_response_dict(response) -> dict | None:
+    """
+    Prefer `response.parsed` when schema enforcement produced a dict /
+    pydantic model; otherwise fall back to JSON-parsing `response.text`,
+    with defensive code-fence stripping for the rare case a model still
+    wraps JSON in markdown.
+    """
+    parsed = getattr(response, "parsed", None)
+    if parsed is not None:
+        if isinstance(parsed, dict):
+            return parsed
+        if hasattr(parsed, "model_dump"):
+            return parsed.model_dump()
+        try:
+            return dict(parsed)
+        except Exception:
+            pass
+
+    raw = getattr(response, "text", None)
     if not raw:
-        return {"error": "empty response"}
+        return None
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Some models prefix or suffix with code fences despite mime; strip and retry.
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.strip("`")
@@ -555,8 +706,47 @@ def query_gemini(snapshot: dict) -> dict:
                 cleaned = cleaned[4:].lstrip()
         try:
             return json.loads(cleaned)
+        except Exception:
+            return {"error": "JSON parse failed", "raw_text": raw}
+
+
+def query_gemini(snapshot: dict) -> dict:
+    """
+    Call Gemini 3.5 Flash via the google-genai SDK with schema-enforced JSON
+    output and a thinking level. Soft-falls-back to plain JSON-mode (no
+    schema) if the SDK rejects our dict-form schema — keeps the engine
+    running while a schema-shape issue is diagnosed.
+    """
+    try:
+        client = _get_genai_client()
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+    prompt = f"DATA SNAPSHOT:\n{json.dumps(snapshot, indent=2)}"
+
+    for label, include_schema in (("schema", True), ("plain-json", False)):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL_NAME,
+                contents=prompt,
+                config=_build_generate_config(include_schema=include_schema),
+            )
         except Exception as e:
-            return {"error": f"JSON parse failed: {e}", "raw_text": raw}
+            msg = str(e).lower()
+            schema_rejection = include_schema and any(
+                s in msg for s in ("schema", "unknown field", "invalid_argument")
+            )
+            if schema_rejection:
+                print(f"[Warning] Gemini schema rejected ({e}); retrying without schema.")
+                continue
+            return {"error": f"Gemini call failed ({label}): {e}"}
+
+        result = _extract_response_dict(response)
+        if result is None:
+            return {"error": "empty response"}
+        return result
+
+    return {"error": "All Gemini config tiers failed"}
 
 
 # ---------------- snapshot retention ---------------- #
