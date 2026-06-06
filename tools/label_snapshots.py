@@ -194,6 +194,8 @@ async def label_snapshot_file(exchange, path: str, horizon_hours: int, force: bo
     analysis = snapshot.get("analysis") or {}
     td = analysis.get("trade_decision") or {}
     fwd = analysis.get("forward_scenario") or {}
+    # engine_trade is the deterministic geometry — this is what calibration scores
+    eng = snapshot.get("engine_trade") or (snapshot.get("strategies") or {}).get("engine_trade") or {}
 
     trade_outcome = None
     side = _direction_to_side(td.get("primary", {}).get("direction"))
@@ -207,12 +209,20 @@ async def label_snapshot_file(exchange, path: str, horizon_hours: int, force: bo
         forward_outcome = _label_one(fwd_side, float(fwd["entry"]), float(fwd["stop_loss"]),
                                      float(fwd["take_profit"]), df)
 
+    engine_outcome = None
+    eng_side = _direction_to_side(eng.get("direction"))
+    if eng.get("valid") and eng_side and eng.get("entry") is not None \
+            and eng.get("stop_loss") is not None and eng.get("take_profit") is not None:
+        engine_outcome = _label_one(eng_side, float(eng["entry"]), float(eng["stop_loss"]),
+                                    float(eng["take_profit"]), df)
+
     snapshot["outcome"] = {
         "labeled_at": datetime.utcnow().isoformat() + "Z",
         "horizon_hours": horizon_hours,
         "bars_observed": int(len(df)),
         "trade_decision_outcome": trade_outcome,
         "forward_scenario_outcome": forward_outcome,
+        "engine_trade_outcome": engine_outcome,
     }
 
     with open(path, "w") as f:

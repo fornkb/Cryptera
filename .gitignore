@@ -1,3 +1,43 @@
+# ---- secrets ----
 .env
+.env.*
+!.env.example
+
+# ---- Python ----
+__pycache__/
+.claude/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---- virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- runtime / generated engine state ----
+# timestamped run snapshots (large, regenerated)
 snapshots/
-IMPROVEMENT_REPORT.md
+# eval_engine --out reports
+reports/
+improvements_report.md
+# engine-managed OI history fallback
+data/oi_history.json
+# fitted weights (machine/data-specific, regenerate)
+data/calibration.json
+
+# ---- tooling / IDE / OS ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+*.log
+
+
+
+

@@ -1,5 +1,5 @@
 """
-Flask backend for the Cryptera v3.1 dashboard.
+Flask backend for the Cryptera v3.2 dashboard.
 
 Returns the snapshot AND the parsed Gemini JSON analysis from `/api/run` and
 `/api/history/<filename>` so the SPA can render structured fields directly.
@@ -125,7 +125,7 @@ def get_snapshot(filename):
 
 if __name__ == "__main__":
     print("\n" + "=" * 50)
-    print("=== CRYPTERA v3.1 WEB TERMINAL RUNNING ===")
+    print("=== CRYPTERA v3.2 WEB TERMINAL RUNNING ===")
     print("Open http://127.0.0.1:5000 in your web browser.")
     print("=" * 50 + "\n")
     app.run(host="127.0.0.1", port=5000, debug=True)

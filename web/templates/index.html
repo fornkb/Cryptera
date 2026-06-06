@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CRYPTERA v3.1 // Institutional SMC Terminal</title>
+    <title>CRYPTERA v3.2 // Institutional SMC Terminal</title>
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -25,7 +25,7 @@
                 </div>
                 <div class="logo-text">
                     <h1>CRYPTERA</h1>
-                    <span class="version-tag">v3.1 CORE // INSTITUTIONAL SMC ENGINE</span>
+                    <span class="version-tag">v3.2 CORE // INSTITUTIONAL SMC ENGINE</span>
                 </div>
             </div>
             <div class="header-status">
@@ -146,6 +146,22 @@
                         </div>
                     </section>
 
+                    <!-- PRICE CHART WITH SMC LEVEL OVERLAYS -->
+                    <section class="chart-row">
+                        <div class="workspace-card chart-card">
+                            <div class="chart-header">
+                                <h3 class="section-title"><i class="fa-solid fa-chart-line"></i> PRICE CHART &amp; LEVELS</h3>
+                                <div class="chart-tf-switcher">
+                                    <button class="chart-tf-btn" data-tf="4h">4H</button>
+                                    <button class="chart-tf-btn" data-tf="1h">1H</button>
+                                    <button class="chart-tf-btn active" data-tf="15m">15M</button>
+                                </div>
+                            </div>
+                            <div id="price-chart" class="price-chart"></div>
+                            <div id="chart-legend" class="chart-legend"></div>
+                        </div>
+                    </section>
+
                     <section class="central-workspace-row">
 
                         <div class="workspace-column flex-4">
@@ -164,7 +180,15 @@
                                     </div>
                                     <div class="confluence-metrics">
                                         <div class="metric-row">
-                                            <span class="metric-label">Active Bias</span>
+                                            <span class="metric-label">Live Price</span>
+                                            <span class="metric-value font-mono"><span id="val-live-price">—</span> <span class="src-note">closed-bar signals</span></span>
+                                        </div>
+                                        <div class="metric-row">
+                                            <span class="metric-label">Score Mode</span>
+                                            <span id="badge-score-mode" class="badge bg-neutral">—</span>
+                                        </div>
+                                        <div class="metric-row">
+                                            <span class="metric-label">Setup Direction</span>
                                             <span id="badge-bias" class="badge bg-neutral">NEUTRAL</span>
                                         </div>
                                         <div class="metric-row">
@@ -176,35 +200,40 @@
                                             <span id="badge-volume-gate" class="badge bg-neutral">—</span>
                                         </div>
                                         <div class="metric-row">
-                                            <span class="metric-label">Entry Level</span>
+                                            <span class="metric-label">Score (base ± flow)</span>
+                                            <span id="val-score-math" class="metric-value font-mono">—</span>
+                                        </div>
+                                        <div class="metric-row">
+                                            <span class="metric-label">Hist. Win Rate</span>
+                                            <span id="val-winrate" class="metric-value font-mono">—</span>
+                                        </div>
+
+                                        <div class="metric-divider"><span id="plan-source-label">ENGINE TRADE PLAN</span></div>
+                                        <div class="metric-row">
+                                            <span class="metric-label">Entry <span id="src-entry" class="src-note"></span></span>
                                             <span id="val-entry" class="metric-value font-mono">N/A</span>
                                         </div>
                                         <div class="metric-row">
-                                            <span class="metric-label">Stop Loss (SL)</span>
+                                            <span class="metric-label">Stop Loss <span id="src-sl" class="src-note"></span></span>
                                             <span id="val-stop-loss" class="metric-value font-mono text-red">N/A</span>
                                         </div>
                                         <div class="metric-row">
-                                            <span class="metric-label">Take Profit (TP)</span>
+                                            <span class="metric-label">Take Profit <span id="src-tp" class="src-note"></span></span>
                                             <span id="val-take-profit" class="metric-value font-mono text-green">N/A</span>
                                         </div>
                                         <div class="metric-row">
                                             <span class="metric-label">R:R</span>
                                             <span id="val-rr" class="metric-value font-mono">—</span>
                                         </div>
+                                        <div class="metric-row order-flow-row">
+                                            <span class="metric-label">Order Flow</span>
+                                            <span id="val-order-flow" class="metric-value">—</span>
+                                        </div>
                                     </div>
                                 </div>
                                 <div class="score-breakdown-wrapper">
-                                    <h4 class="card-subtitle-small">SCORE BREAKDOWN (C1-C8)</h4>
-                                    <div class="breakdown-grid">
-                                        <div class="breakdown-item"><span class="item-lbl">C1 Trend (25)</span><span id="score-c1" class="item-val font-mono">0</span></div>
-                                        <div class="breakdown-item"><span class="item-lbl">C2 OB Prox (15)</span><span id="score-c2" class="item-val font-mono">0</span></div>
-                                        <div class="breakdown-item"><span class="item-lbl">C3 Sweep (10)</span><span id="score-c3" class="item-val font-mono">0</span></div>
-                                        <div class="breakdown-item"><span class="item-lbl">C4 Momentum (15)</span><span id="score-c4" class="item-val font-mono">0</span></div>
-                                        <div class="breakdown-item"><span class="item-lbl">C5 FVG Magnet (15)</span><span id="score-c5" class="item-val font-mono">0</span></div>
-                                        <div class="breakdown-item"><span class="item-lbl">C6 OTE (10)</span><span id="score-c6" class="item-val font-mono">0</span></div>
-                                        <div class="breakdown-item"><span class="item-lbl">C7 CVD (10)</span><span id="score-c7" class="item-val font-mono">0</span></div>
-                                        <div class="breakdown-item"><span class="item-lbl">C8 StochRSI (5)</span><span id="score-c8" class="item-val font-mono">0</span></div>
-                                    </div>
+                                    <h4 class="card-subtitle-small"><span id="score-breakdown-title">SCORE BREAKDOWN</span></h4>
+                                    <div id="score-breakdown-grid" class="breakdown-grid"></div>
                                 </div>
                             </div>
                         </div>
@@ -270,6 +299,21 @@
                                             <span class="card-subtitle-small">CVD ALIGNMENT &amp; WARNINGS</span>
                                             <div class="levels-box flex-column" id="val-cvd-container">
                                                 <div class="box-message">No active CVD absorption divergences.</div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div class="levels-split-row">
+                                        <div class="level-column">
+                                            <span class="card-subtitle-small">MARKET STRUCTURE (BOS / CHoCH / OTE)</span>
+                                            <div class="levels-box flex-column" id="val-structure-container">
+                                                <div class="box-message">No structure data.</div>
+                                            </div>
+                                        </div>
+                                        <div class="level-column">
+                                            <span class="card-subtitle-small">MAGNET TARGETS (UNTESTED POC)</span>
+                                            <div class="levels-box flex-column" id="val-targets-container">
+                                                <div class="box-message">No untested magnet levels.</div>
                                             </div>
                                         </div>
                                     </div>
@@ -364,6 +408,7 @@
         </div>
     </div>
 
+    <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>

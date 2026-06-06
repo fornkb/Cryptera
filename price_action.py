@@ -1,8 +1,9 @@
 """
-Cryptera v3.1 - Price Action (PA) Engine
+Cryptera v3.2 - Price Action (PA) Engine
 
-ATR-normalised S/R clustering, multi-TF volume profile, plus untested HTF POC
-tracking (useful as magnet targets).
+Volume profile is range-distributed (each candle's volume spread across its
+high-low range), not close-only. Session POCs use true non-overlapping windows.
+Candle-pattern detection is limited to confirmation-grade reversal patterns.
 """
 
 import pandas as pd
@@ -21,31 +22,26 @@ def _atr_pct(df: pd.DataFrame, fallback: float = 0.005) -> float:
 
 
 def detect_candle_pattern(df: pd.DataFrame) -> str:
-    """Manual classifier over the last 3 candles. Returns pattern name or 'none'."""
+    """
+    Confirmation-grade pattern over the last 1-3 candles. Limited to patterns
+    with genuine reversal/continuation signal at a level: pin bars, engulfing,
+    morning/evening star. Pure-noise single-bar patterns (doji, inside bar) are
+    intentionally excluded.
+    """
     if len(df) < 3:
         return "none"
-
-    c2 = df.iloc[-3]
-    c1 = df.iloc[-2]
-    c0 = df.iloc[-1]
+    c2, c1, c0 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
 
     def props(c):
         body = abs(c["close"] - c["open"])
         rng = c["high"] - c["low"] if c["high"] - c["low"] > 0 else 0.001
-        is_green = c["close"] > c["open"]
-        is_red = c["close"] < c["open"]
-        lower_wick = min(c["open"], c["close"]) - c["low"]
-        upper_wick = c["high"] - max(c["open"], c["close"])
-        return body, rng, is_green, is_red, lower_wick, upper_wick
+        return body, rng, c["close"] > c["open"], c["close"] < c["open"], \
+            min(c["open"], c["close"]) - c["low"], c["high"] - max(c["open"], c["close"])
 
     b0, r0, g0, r_0, lw0, uw0 = props(c0)
     b1, r1, g1, r_1, lw1, uw1 = props(c1)
     b2, r2, g2, r_2, lw2, uw2 = props(c2)
 
-    if r0 > 0 and b0 / r0 <= 0.1:
-        return "doji"
-    if c0["high"] < c1["high"] and c0["low"] > c1["low"]:
-        return "inside_bar"
     if r0 > 0 and (lw0 / r0 >= 0.6) and (b0 / r0 <= 0.3):
         return "pin_bar_bull"
     if r0 > 0 and (uw0 / r0 >= 0.6) and (b0 / r0 <= 0.3):
@@ -61,67 +57,90 @@ def detect_candle_pattern(df: pd.DataFrame) -> str:
     return "none"
 
 
-def get_poc(df: pd.DataFrame, lookback=50, buckets=100) -> float:
+# ---------------- range-distributed volume profile ---------------- #
+
+def _build_profile(df: pd.DataFrame, lookback: int, buckets: int):
+    """
+    Distribute each candle's volume uniformly across its [low, high] range into a
+    price histogram. Returns (hist, bin_edges) or (None, None) on degenerate input.
+    """
     recent = df.tail(lookback)
-    closes = recent["close"].values
-    vols = recent["volume"].values
-    min_price = closes.min()
-    max_price = closes.max()
-    if max_price == min_price:
-        return float(min_price)
-    hist, bin_edges = np.histogram(closes, bins=buckets, weights=vols)
-    max_idx = np.argmax(hist)
-    return float((bin_edges[max_idx] + bin_edges[max_idx + 1]) / 2)
+    lows = recent["low"].to_numpy(dtype=float)
+    highs = recent["high"].to_numpy(dtype=float)
+    vols = recent["volume"].to_numpy(dtype=float)
+
+    p_min = float(np.min(lows))
+    p_max = float(np.max(highs))
+    if not np.isfinite(p_min) or not np.isfinite(p_max) or p_max <= p_min:
+        return None, None
+
+    edges = np.linspace(p_min, p_max, buckets + 1)
+    hist = np.zeros(buckets, dtype=float)
+    bin_w = (p_max - p_min) / buckets
+
+    for lo, hi, vol in zip(lows, highs, vols):
+        if vol <= 0:
+            continue
+        if hi <= lo:
+            # zero-range bar: dump into its single bin
+            b = min(int((lo - p_min) / bin_w), buckets - 1)
+            hist[b] += vol
+            continue
+        lo_b = int((lo - p_min) / bin_w)
+        hi_b = min(int((hi - p_min) / bin_w), buckets - 1)
+        lo_b = max(lo_b, 0)
+        span = hi_b - lo_b + 1
+        # spread this candle's volume evenly across the bins it covers
+        hist[lo_b:hi_b + 1] += vol / span
+
+    return hist, edges
+
+
+def get_poc(df: pd.DataFrame, lookback=50, buckets=100) -> float:
+    hist, edges = _build_profile(df, lookback, buckets)
+    if hist is None:
+        return float(df["close"].iloc[-1])
+    idx = int(np.argmax(hist))
+    return float((edges[idx] + edges[idx + 1]) / 2)
 
 
 def get_value_area(df: pd.DataFrame, lookback=50, buckets=100) -> dict:
-    recent = df.tail(lookback)
-    closes = recent["close"].values
-    vols = recent["volume"].values
-    min_price = closes.min()
-    max_price = closes.max()
-    if max_price == min_price:
-        return {"vah": float(max_price), "val": float(min_price), "poc": float(min_price)}
+    hist, edges = _build_profile(df, lookback, buckets)
+    if hist is None:
+        price = float(df["close"].iloc[-1])
+        return {"vah": price, "val": price, "poc": price}
 
-    hist, bin_edges = np.histogram(closes, bins=buckets, weights=vols)
-    max_idx = np.argmax(hist)
-    poc = (bin_edges[max_idx] + bin_edges[max_idx + 1]) / 2
-
-    total_vol = hist.sum()
-    if total_vol <= 0:
+    max_idx = int(np.argmax(hist))
+    poc = (edges[max_idx] + edges[max_idx + 1]) / 2
+    total = hist.sum()
+    if total <= 0:
         return {"vah": float(poc), "val": float(poc), "poc": float(poc)}
 
-    target_vol = total_vol * 0.70
-    selected_bins = {max_idx}
-    current_vol = hist[max_idx]
-    left_idx = max_idx - 1
-    right_idx = max_idx + 1
-
-    while current_vol < target_vol:
-        left_vol = hist[left_idx] if left_idx >= 0 else 0
-        right_vol = hist[right_idx] if right_idx < buckets else 0
-        if left_vol == 0 and right_vol == 0:
+    target = total * 0.70
+    selected = {max_idx}
+    cur = hist[max_idx]
+    left, right = max_idx - 1, max_idx + 1
+    while cur < target:
+        lv = hist[left] if left >= 0 else 0
+        rv = hist[right] if right < buckets else 0
+        if lv == 0 and rv == 0:
             break
-        if left_vol >= right_vol:
-            selected_bins.add(left_idx)
-            current_vol += left_vol
-            left_idx -= 1
+        if lv >= rv:
+            selected.add(left)
+            cur += lv
+            left -= 1
         else:
-            selected_bins.add(right_idx)
-            current_vol += right_vol
-            right_idx += 1
+            selected.add(right)
+            cur += rv
+            right += 1
 
-    val = bin_edges[min(selected_bins)]
-    vah = bin_edges[max(selected_bins) + 1]
+    val = edges[min(selected)]
+    vah = edges[max(selected) + 1]
     return {"vah": float(vah), "val": float(val), "poc": float(poc)}
 
 
-def get_sr_levels(swing_highs, swing_lows, current_price, value_area=None,
-                  atr_pct: float = 0.003) -> dict:
-    """
-    Cluster swings within an ATR-scaled tolerance into S/R zones. Each zone
-    carries a touch count and a high-confidence flag if it aligns with VAH/POC/VAL.
-    """
+def get_sr_levels(swing_highs, swing_lows, current_price, value_area=None, atr_pct: float = 0.003) -> dict:
+    """Cluster swings into S/R zones with touch counts and VA-aligned confidence flags."""
     tolerance = max(0.0015, min(0.01, atr_pct * 0.6))
     hvn_tol = max(0.002, min(0.01, atr_pct * 0.7))
 
@@ -129,41 +148,33 @@ def get_sr_levels(swing_highs, swing_lows, current_price, value_area=None,
     if not prices:
         return {"support": [], "resistance": []}
 
-    clusters = []
-    current_cluster = []
+    clusters, current = [], []
     for p in prices:
-        if not current_cluster:
-            current_cluster.append(p)
+        if not current:
+            current.append(p)
         else:
-            base = current_cluster[0]
+            base = current[0]
             if base > 0 and (p - base) / base <= tolerance:
-                current_cluster.append(p)
+                current.append(p)
             else:
-                clusters.append(current_cluster)
-                current_cluster = [p]
-    if current_cluster:
-        clusters.append(current_cluster)
+                clusters.append(current)
+                current = [p]
+    if current:
+        clusters.append(current)
 
-    sr_zones = []
+    zones = []
     for c in clusters:
-        avg_price = sum(c) / len(c)
-        touch_count = len(c)
-        is_high_conf = False
+        avg = sum(c) / len(c)
+        high_conf = False
         if value_area:
             for level in (value_area["vah"], value_area["val"], value_area["poc"]):
-                if level > 0 and abs(avg_price - level) / level <= hvn_tol:
-                    is_high_conf = True
+                if level > 0 and abs(avg - level) / level <= hvn_tol:
+                    high_conf = True
                     break
-        sr_zones.append({
-            "price": float(avg_price),
-            "touches": int(touch_count),
-            "high_confidence": is_high_conf,
-        })
+        zones.append({"price": float(avg), "touches": len(c), "high_confidence": high_conf})
 
-    supports = sorted([z for z in sr_zones if z["price"] < current_price],
-                      key=lambda x: x["price"], reverse=True)[:3]
-    resistances = sorted([z for z in sr_zones if z["price"] > current_price],
-                         key=lambda x: x["price"])[:3]
+    supports = sorted([z for z in zones if z["price"] < current_price], key=lambda x: x["price"], reverse=True)[:3]
+    resistances = sorted([z for z in zones if z["price"] > current_price], key=lambda x: x["price"])[:3]
     return {"support": supports, "resistance": resistances}
 
 
@@ -178,61 +189,68 @@ def calculate_previous_day(df: pd.DataFrame):
         return float(df["high"].max()), float(df["low"].min()), float(df["close"].iloc[-1])
 
 
-def find_untested_pocs(df: pd.DataFrame, sessions: int = 5, lookback_per_session: int = 50) -> list:
+def find_untested_pocs(df: pd.DataFrame, n_sessions: int = 4, session_bars: int = 50) -> list:
     """
-    Build a list of session POCs that have not been re-tested since formation.
-    Strong magnet targets for trades anchored to volume.
+    True non-overlapping session POCs that have not been re-tested since they
+    formed. The most-recent (still-developing) window is skipped because it has
+    no post-formation data to test against (fixes B2). Returns up to 5 magnets
+    sorted by proximity to current price.
     """
     if df is None or df.empty:
         return []
-    out = []
     n = len(df)
-    if n < lookback_per_session:
-        return []
     current_price = float(df["close"].iloc[-1])
-    step = max(1, lookback_per_session // 2)
-    for s in range(sessions):
-        end = n - s * step
-        start = end - lookback_per_session
+    out = []
+    # session s spans [n - (s+1)*bars, n - s*bars); s=0 is the developing window -> skip
+    for s in range(1, n_sessions + 1):
+        end = n - s * session_bars
+        start = end - session_bars
         if start < 0 or end <= start:
             break
-        slice_df = df.iloc[start:end]
-        if slice_df.empty:
+        window = df.iloc[start:end]
+        if window.empty:
             continue
-        poc = get_poc(slice_df)
-        # untested if price has not returned to within 0.5% of POC since end-of-session
+        poc = get_poc(window, lookback=session_bars)
         post = df.iloc[end:]
-        if post.empty:
-            tested = False
-        else:
-            band = max(poc * 0.005, 1e-6)
-            tested = ((post["high"] >= poc - band) & (post["low"] <= poc + band)).any()
+        band = max(poc * 0.005, 1e-6)
+        tested = (not post.empty) and ((post["high"] >= poc - band) & (post["low"] <= poc + band)).any()
         if not tested:
+            ts = window["timestamp"].iloc[-1]
             out.append({
                 "poc": float(poc),
-                "session_end_ts": slice_df["timestamp"].iloc[-1].isoformat() if hasattr(slice_df["timestamp"].iloc[-1], "isoformat") else str(slice_df["timestamp"].iloc[-1]),
+                "session_end_ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
                 "distance_pct": round(abs(current_price - poc) / current_price * 100, 3) if current_price > 0 else None,
             })
-    return out[:5]
+    # de-dup near-identical POCs and sort by proximity
+    deduped = []
+    for p in sorted(out, key=lambda x: (x["distance_pct"] if x["distance_pct"] is not None else 1e9)):
+        if all(abs(p["poc"] - q["poc"]) / max(q["poc"], 1e-9) > 0.002 for q in deduped):
+            deduped.append(p)
+    return deduped[:5]
 
 
-def build_pa_context(df_1h, df_15m, df_4h=None) -> dict:
+def build_pa_context(df_1h, df_15m, df_4h=None, value_areas: dict = None) -> dict:
+    """value_areas: optional pre-computed {tf:{vah,val,poc}} to avoid recompute (B11)."""
     if df_15m is None or df_15m.empty:
         return {}
 
+    value_areas = value_areas or {}
     current_price = float(df_15m["close"].iloc[-1])
     last_pattern = detect_candle_pattern(df_15m)
 
-    va_15m = get_value_area(df_15m) if df_15m is not None and not df_15m.empty else {"vah": current_price, "val": current_price, "poc": current_price}
-    va_1h = get_value_area(df_1h) if df_1h is not None and not df_1h.empty else {"vah": current_price, "val": current_price, "poc": current_price}
-    va_4h = get_value_area(df_4h) if df_4h is not None and not df_4h.empty else {"vah": current_price, "val": current_price, "poc": current_price}
+    va_15m = value_areas.get("15m") or get_value_area(df_15m)
+    va_1h = value_areas.get("1h") or (get_value_area(df_1h) if df_1h is not None and not df_1h.empty
+                                      else {"vah": current_price, "val": current_price, "poc": current_price})
+    va_4h = value_areas.get("4h") or (get_value_area(df_4h) if df_4h is not None and not df_4h.empty
+                                      else {"vah": current_price, "val": current_price, "poc": current_price})
 
     sh, sl = find_swings(df_15m, left=3, right=2)
     sr_levels = get_sr_levels(sh, sl, current_price, value_area=va_1h, atr_pct=_atr_pct(df_15m))
 
-    pdh, pdl, pdc = calculate_previous_day(df_1h) if df_1h is not None and not df_1h.empty else (current_price, current_price, current_price)
+    pdh, pdl, pdc = calculate_previous_day(df_1h) if df_1h is not None and not df_1h.empty \
+        else (current_price, current_price, current_price)
 
-    untested_pocs_4h = find_untested_pocs(df_4h, sessions=5, lookback_per_session=50) if df_4h is not None and not df_4h.empty else []
+    untested_pocs_4h = find_untested_pocs(df_4h) if df_4h is not None and not df_4h.empty else []
 
     return {
         "last_candle_pattern_15m": last_pattern,

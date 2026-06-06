@@ -1,10 +1,17 @@
 """
 Indicator Engine - SMC + Momentum + Volume + Volatility
+
+CVD is computed from real taker-initiated volume when the kline `taker_buy_base`
+column is present (see main.fetch_taker_flow); otherwise it falls back to a
+labelled candle-position proxy. Swing columns use the same fractal definition as
+smc.py (single source of truth).
 """
 
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
+
+from smc import fractal_swing_mask, SWING_WIDTHS, DEFAULT_WIDTH
 
 
 def calculate_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFrame:
@@ -19,7 +26,6 @@ def calculate_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFram
     atr_mean = df["ATR"].rolling(50).mean()
     atr_std = df["ATR"].rolling(50).std()
     df["ATR_Z"] = (df["ATR"] - atr_mean) / atr_std
-    # ATR percentile rank over a 100-bar rolling window (0..1)
     df["ATR_Pct"] = df["ATR"].rolling(100, min_periods=20).rank(pct=True)
 
     # === MOMENTUM ===
@@ -66,14 +72,11 @@ def calculate_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFram
     # === ADX ===
     try:
         adx = ta.adx(df["high"], df["low"], df["close"], length=14)
-        if adx is not None:
-            df["ADX"] = adx["ADX_14"]
-        else:
-            df["ADX"] = np.nan
+        df["ADX"] = adx["ADX_14"] if adx is not None else np.nan
     except Exception:
         df["ADX"] = np.nan
 
-    # === BOLLINGER BANDS (for real squeeze detection) ===
+    # === BOLLINGER BANDS (squeeze) ===
     try:
         bb = ta.bbands(df["close"], length=20, std=2.0)
         if bb is not None:
@@ -82,9 +85,7 @@ def calculate_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFram
             middle = next((c for c in cols if c.startswith("BBM_")), None)
             upper = next((c for c in cols if c.startswith("BBU_")), None)
             if lower and middle and upper:
-                df["BB_LOWER"] = bb[lower]
-                df["BB_MIDDLE"] = bb[middle]
-                df["BB_UPPER"] = bb[upper]
+                df["BB_LOWER"], df["BB_MIDDLE"], df["BB_UPPER"] = bb[lower], bb[middle], bb[upper]
                 df["BB_WIDTH"] = (df["BB_UPPER"] - df["BB_LOWER"]) / df["BB_MIDDLE"].replace(0, np.nan)
             else:
                 df["BB_WIDTH"] = np.nan
@@ -93,33 +94,36 @@ def calculate_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFram
     except Exception:
         df["BB_WIDTH"] = np.nan
 
-    # === CVD PROXY (candle-position) ===
-    range_val = df["high"] - df["low"]
-    multiplier = np.where(range_val > 0, ((df["close"] - df["low"]) - (df["high"] - df["close"])) / range_val, 0.0)
-    df["cvd"] = (df["volume"] * multiplier).cumsum()
+    # === CVD: real taker flow if available, else candle-position proxy ===
+    if "taker_buy_base" in df.columns and df["taker_buy_base"].notna().any():
+        taker_buy = df["taker_buy_base"].fillna(df["volume"] / 2.0)
+        df["cvd_delta_bar"] = (2.0 * taker_buy) - df["volume"]   # buy - sell
+        df["cvd"] = df["cvd_delta_bar"].cumsum()
+        df["cvd_real"] = True
+    else:
+        rng = df["high"] - df["low"]
+        mult = np.where(rng > 0, ((df["close"] - df["low"]) - (df["high"] - df["close"])) / rng, 0.0)
+        df["cvd_delta_bar"] = df["volume"] * mult
+        df["cvd"] = df["cvd_delta_bar"].cumsum()
+        df["cvd_real"] = False
 
-    # === SWING POINTS ===
-    df["swing_high"] = df["high"] == df["high"].rolling(5, center=True).max()
-    df["swing_low"] = df["low"] == df["low"].rolling(5, center=True).min()
+    # === SWING POINTS (shared fractal definition with smc.py) ===
+    left, right = SWING_WIDTHS.get(timeframe, DEFAULT_WIDTH)
+    is_high, is_low = fractal_swing_mask(df["high"], df["low"], left, right)
+    df["swing_high"] = is_high
+    df["swing_low"] = is_low
 
-    # === FAIR VALUE GAPS (per-candle flags) ===
+    # === FAIR VALUE GAP flags (per candle) ===
     high_2 = df["high"].shift(2)
     low_2 = df["low"].shift(2)
     df["fvg_bull"] = df["low"] > high_2
     df["fvg_bear"] = df["high"] < low_2
-    df["fvg_bull_top"] = np.where(df["fvg_bull"], df["low"], np.nan)
-    df["fvg_bull_bottom"] = np.where(df["fvg_bull"], high_2, np.nan)
-    df["fvg_bear_top"] = np.where(df["fvg_bear"], low_2, np.nan)
-    df["fvg_bear_bottom"] = np.where(df["fvg_bear"], df["high"], np.nan)
 
     return df
 
 
 def detect_volatility_regime(df: pd.DataFrame) -> dict:
-    """
-    Categorise the current volatility regime using ATR percentile and BB width.
-    Returns {"regime": "compressed|normal|expanded", "atr_pct": float, "bb_width": float}.
-    """
+    """Volatility regime from ATR percentile + BB width."""
     if df is None or df.empty:
         return {"regime": "unknown", "atr_percentile": None, "bb_width": None}
     atr_pct = df["ATR_Pct"].iloc[-1] if "ATR_Pct" in df.columns else None
@@ -141,12 +145,8 @@ def detect_volatility_regime(df: pd.DataFrame) -> dict:
     }
 
 
-def detect_regime(df_4h: pd.DataFrame, df_1h: pd.DataFrame, df_15m: pd.DataFrame,
-                  smc_context: dict = None) -> str:
-    """
-    Global market regime. Prefers the SMC structure read when available;
-    falls back to weighted EMA/RSI scoring across timeframes when not.
-    """
+def detect_regime(df_4h, df_1h, df_15m, smc_context: dict = None) -> str:
+    """Global regime: SMC structure first, weighted EMA/RSI fallback."""
     if smc_context:
         struct_4h = smc_context.get("4h", {}).get("structure", "NEUTRAL")
         struct_1h = smc_context.get("1h", {}).get("structure", "NEUTRAL")
@@ -155,6 +155,7 @@ def detect_regime(df_4h: pd.DataFrame, df_1h: pd.DataFrame, df_15m: pd.DataFrame
 
         def is_bull(s):
             return "HH" in s and "HL" in s
+
         def is_bear(s):
             return "LH" in s and "LL" in s
 
@@ -162,7 +163,6 @@ def detect_regime(df_4h: pd.DataFrame, df_1h: pd.DataFrame, df_15m: pd.DataFrame
             return "Trending Bullish"
         if is_bear(struct_4h):
             return "Trending Bearish"
-
         if bos_1h.get("level") is None and not choch_1h.get("detected") and not (is_bull(struct_1h) or is_bear(struct_1h)):
             return "Ranging / Sideways"
 
@@ -172,15 +172,11 @@ def detect_regime(df_4h: pd.DataFrame, df_1h: pd.DataFrame, df_15m: pd.DataFrame
         latest = df.iloc[-1]
         score = 0
         if pd.notna(latest["EMA_50"]) and pd.notna(latest["EMA_200"]):
-            if latest["EMA_50"] > latest["EMA_200"]:
-                score += 2
-            else:
-                score -= 2
+            score += 2 if latest["EMA_50"] > latest["EMA_200"] else -2
         if "RSI" in df.columns and pd.notna(latest["RSI"]):
-            rsi = latest["RSI"]
-            if rsi > 60:
+            if latest["RSI"] > 60:
                 score += 1
-            elif rsi < 40:
+            elif latest["RSI"] < 40:
                 score -= 1
         return score
 
@@ -190,30 +186,3 @@ def detect_regime(df_4h: pd.DataFrame, df_1h: pd.DataFrame, df_15m: pd.DataFrame
     if weighted < -0.8:
         return "Trending Bearish"
     return "Ranging / Sideways"
-
-
-def get_market_structure(df: pd.DataFrame) -> dict:
-    """Legacy single-TF structure view retained for callers that still use it."""
-    latest = df.iloc[-1]
-    swing_highs = df[df["swing_high"]].tail(3) if "swing_high" in df.columns else df.iloc[0:0]
-    swing_lows = df[df["swing_low"]].tail(3) if "swing_low" in df.columns else df.iloc[0:0]
-    recent = df.tail(20)
-    bull_fvg = recent[recent["fvg_bull"]] if "fvg_bull" in recent.columns else recent.iloc[0:0]
-    bear_fvg = recent[recent["fvg_bear"]] if "fvg_bear" in recent.columns else recent.iloc[0:0]
-
-    return {
-        "price": float(latest["close"]),
-        "trend": "bullish" if latest["EMA_50"] > latest["EMA_200"] else "bearish",
-        "rsi": float(latest["RSI"]) if pd.notna(latest.get("RSI")) else None,
-        "atr_z": float(latest["ATR_Z"]) if pd.notna(latest.get("ATR_Z")) else None,
-        "buy_side_liquidity": swing_highs["high"].tolist(),
-        "sell_side_liquidity": swing_lows["low"].tolist(),
-        "bull_fvg": None if bull_fvg.empty else {
-            "top": float(bull_fvg.iloc[-1]["fvg_bull_top"]),
-            "bottom": float(bull_fvg.iloc[-1]["fvg_bull_bottom"]),
-        },
-        "bear_fvg": None if bear_fvg.empty else {
-            "top": float(bear_fvg.iloc[-1]["fvg_bear_top"]),
-            "bottom": float(bear_fvg.iloc[-1]["fvg_bear_bottom"]),
-        },
-    }

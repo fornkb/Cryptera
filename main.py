@@ -1,5 +1,5 @@
 """
-Cryptera v3.1 - Rule-based SMC engine + Gemini AI structured JSON narration.
+Cryptera v3.2 - Rule-based SMC engine + Gemini AI structured JSON narration.
 """
 
 import ccxt.async_support as ccxt
@@ -19,10 +19,10 @@ from google.genai import types as genai_types
 from indicators import calculate_indicators, detect_regime, detect_volatility_regime
 from strategies import evaluate_strategies
 from smc import build_smc_context
-from price_action import build_pa_context, calculate_previous_day
+from price_action import build_pa_context, calculate_previous_day, get_value_area
 
 
-SCHEMA_VERSION = "3.1.0"
+SCHEMA_VERSION = "3.2.0"
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
@@ -55,6 +55,7 @@ def to_native(obj):
 TIMEFRAMES = ["4h", "1h", "15m"]
 LIMITS = {"4h": 200, "1h": 200, "15m": 300}
 WINDOW_SIZE = {"4h": 10, "1h": 20, "15m": 30}
+TF_MS = {"4h": 4 * 3600_000, "1h": 3600_000, "15m": 15 * 60_000}  # bar length in ms
 
 
 def get_window_dict(df: pd.DataFrame, size: int) -> dict:
@@ -85,6 +86,7 @@ def get_window_dict(df: pd.DataFrame, size: int) -> dict:
         cvd_vals = recent["cvd"].dropna().tolist()
         if len(cvd_vals) >= 2:
             cvd_change = round(cvd_vals[-1] - cvd_vals[0], 2)
+    cvd_real = bool(recent["cvd_real"].iloc[-1]) if "cvd_real" in recent.columns and not recent.empty else False
 
     recent_5 = df.tail(5)
     close_series = [round(float(x), 2) for x in recent_5["close"].tolist()]
@@ -99,11 +101,39 @@ def get_window_dict(df: pd.DataFrame, size: int) -> dict:
         "stochrsi_k": stochrsi_k,
         "stochrsi_d": stochrsi_d,
         "cvd_window_delta": cvd_change,
+        "cvd_is_real": cvd_real,
         "adx": adx_latest,
         "atr_percentile": atr_pct_latest,
         "close_series_last_5": close_series,
         "rsi_series_last_5": rsi_series,
     }
+
+
+# ---------------- chart series (for the dashboard candlestick chart) ---------------- #
+
+CHART_BARS = {"4h": 120, "1h": 150, "15m": 180}
+
+
+def build_chart_series(data: dict) -> dict:
+    """
+    Compact OHLC arrays per timeframe for the frontend price chart. Attached to
+    the snapshot AFTER the Gemini call so it never bloats the LLM prompt. Times
+    are UNIX seconds (UTC) as lightweight-charts expects.
+    """
+    out = {}
+    for tf, df in data.items():
+        if df is None or df.empty:
+            out[tf] = []
+            continue
+        sub = df.tail(CHART_BARS.get(tf, 150))
+        times = (sub["timestamp"].astype("int64") // 10**9).tolist()
+        o = sub["open"].astype(float).round(6).tolist()
+        h = sub["high"].astype(float).round(6).tolist()
+        l = sub["low"].astype(float).round(6).tolist()
+        c = sub["close"].astype(float).round(6).tolist()
+        out[tf] = [{"time": int(t), "open": oo, "high": hh, "low": ll, "close": cc}
+                   for t, oo, hh, ll, cc in zip(times, o, h, l, c)]
+    return out
 
 
 # ---------------- caching ---------------- #
@@ -129,11 +159,56 @@ def _cache_put(key, value):
 
 # ---------------- market data ---------------- #
 
+def fetch_taker_flow(symbol, tf, limit):
+    """
+    Fetch raw futures klines to obtain per-bar taker-buy base volume, indexed by
+    open timestamp. Enables REAL aggressive CVD (buy - sell) instead of the
+    candle-position proxy. Returns a DataFrame[timestamp, taker_buy_base] or None.
+    """
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/klines",
+            params={"symbol": symbol.replace("/", ""), "interval": tf, "limit": limit},
+            timeout=8,
+        ).json()
+        if not isinstance(r, list) or not r:
+            return None
+        rows = []
+        for k in r:
+            # [0]=openTime ... [5]=volume ... [9]=takerBuyBaseVol
+            rows.append((int(k[0]), float(k[9])))
+        df = pd.DataFrame(rows, columns=["timestamp", "taker_buy_base"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        return df
+    except Exception as e:
+        print(f"[Warning] Taker-flow fetch failed for {tf}: {e}")
+        return None
+
+
+def _drop_forming_candle(df: pd.DataFrame, tf: str, now_ms: int) -> pd.DataFrame:
+    """
+    Remove the last row if its bar has not closed yet, so all indicators and
+    structure are computed on CLOSED candles only (fixes B3/B4/T1-1).
+    """
+    if df is None or df.empty:
+        return df
+    last_open_ms = int(df["timestamp"].iloc[-1].value // 1_000_000)
+    if now_ms < last_open_ms + TF_MS[tf]:
+        return df.iloc[:-1].reset_index(drop=True)
+    return df
+
+
 async def fetch_ohlcv(symbol):
-    """Fetch and index OHLCV across the configured timeframes with retry + LRU cache."""
+    """
+    Fetch OHLCV + taker flow across timeframes (retry + LRU cache), drop the
+    forming candle, attach real-CVD inputs, and compute indicators on closed
+    bars. Returns (data: {tf: df}, live_price: float).
+    """
     exchange = ccxt.binance({"enableRateLimit": True})
     raw_dfs = {}
     now = time.time()
+    now_ms = int(now * 1000)
+    live_price = None
 
     try:
         for tf in TIMEFRAMES:
@@ -158,15 +233,28 @@ async def fetch_ohlcv(symbol):
             if candles is not None:
                 df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
                 df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+                # capture the freshest (possibly forming) 15m close as the live price
+                if tf == "15m":
+                    live_price = float(df["close"].iloc[-1])
+                # merge real taker-buy volume (best-effort) before dropping forming bar
+                taker = await asyncio.to_thread(fetch_taker_flow, symbol, tf, LIMITS[tf])
+                if taker is not None:
+                    df = df.merge(taker, on="timestamp", how="left")
+                df = _drop_forming_candle(df, tf, now_ms)
                 raw_dfs[tf] = df
                 _cache_put(cache_key, (now, df.copy()))
+            elif tf == "15m" and cache_key in OHLCV_CACHE:
+                pass
     finally:
         await exchange.close()
+
+    if live_price is None and "15m" in raw_dfs and not raw_dfs["15m"].empty:
+        live_price = float(raw_dfs["15m"]["close"].iloc[-1])
 
     data = {}
     for tf, df in raw_dfs.items():
         data[tf] = await asyncio.to_thread(calculate_indicators, df, timeframe=tf)
-    return data
+    return data, live_price
 
 
 def fetch_orderbook(symbol):
@@ -413,22 +501,25 @@ def fetch_event_window(now_ts: float = None, window_hours: int = 2) -> dict:
 # ---------------- Gemini ---------------- #
 
 GEMINI_SYSTEM_INSTRUCTION = """
-ICT/SMC institutional trade engine. Return a JSON object matching the enforced schema.
+ICT/SMC institutional trade engine. Return a JSON object matching the enforced schema. Signals are computed on CLOSED candles; `live_price` is the current price for distance/trigger context only.
 
 Rules
 1. Use only numbers present in the snapshot. Never invent levels.
-2. `strategies.confluence_breakdown` is authoritative. Echo it; only set `header.score_override` if a specific factual error in the pre-computed score is found.
-3. Min 1:2 R:R. SL within 0.5%-1.5% of entry. Entry at or near current 15m OB/FVG edge or current price.
+2. `strategies.confluence_score` is authoritative (already includes the order-flow modifier). Echo it; only set `header.score_override` on a specific factual error.
+3. `strategies.engine_trade` is the engine's deterministic entry/SL/TP. PREFER it. You may refine within ~0.3% but must not invent far-away levels; if you deviate, say why in reasoning. Enforce min 1:2 R:R.
 
-Scoring rubric (already computed in snapshot)
- C1 trend (25)        ADX-tiered when 4H/1H agree; +10 base on conflict
- C2 ob_prox (15)      0/5/10/15 by distance to nearest 15m or 1H OB/FVG edge
- C3 sweep (10)        binary sweep+reclaim of a swing pool
- C4 momentum (15)     +10 if 1H RSI/MACD aligns; +/-5 RSI slope
- C5 fvg_magnet (15)   unfilled FVG within 3% on 1H or 4H
- C6 ote (10)          in_ote on 1H or 4H
- C7 cvd (10)          2+ TF CVD signs match bias; 0 if 15m opposes 4H
- C8 stoch (5)         1H StochRSI overbought (sell) / oversold (buy)
+Regime-conditional scoring — read `strategies.score_mode`:
+ score_mode == "trend" (trending regime): components C1-C8 measure trend continuation.
+   C1 trend(25) ADX-tiered on 4H/1H agreement · C2 ob_prox(15) distance to 15m/1H OB·FVG
+   C3 sweep(10) HTF sweep+reclaim (6 if 15m-only) · C4 momentum(15) 1H RSI/MACD ±slope
+   C5 fvg_magnet(15) · C6 ote(10) · C7 cvd(10) real taker-flow CVD · C8 stoch(5)
+ score_mode == "mean_revert" (ranging regime): FADE the value-area edge, do not chase trend.
+   M1 edge_distance(25) proximity to VAH/VAL · M2 edge_sweep(15) sweep of the edge
+   M3 cvd_absorption(15) · M4 stoch_extreme(15) · M5 rejection candle(10) · M6 range_intact(10)
+   Direction = SELL near VAH, BUY near VAL. `setup_direction` carries this.
+
+Order flow: `strategies.order_flow_modifier` (already in the score) reflects L2 depth imbalance,
+funding crowding, OI build and F&G extremes — cite `order_flow_notes` in the sentiment reasoning.
 
 Thresholds
  score >= 60 → ACTIVE_TRADE   45-59 → CONDITIONAL_ENTRY   < 45 → HOLD
@@ -437,14 +528,13 @@ Gates
  volume_gate.HARD_GATE        → force HOLD regardless of score
  volume_gate.LOW_VOL_WARNING  → position_size = "50% low-vol"; require +1 confluence
  event_guard.active == true   → cap action at CONDITIONAL_ENTRY; reduce confidence by 15
- 4H/1H conflict               → follow 4H; cite as risk
- 15m diverges 1H              → counter_structure = true; require 15m CHoCH/BOS
  cvd_absorption_warning       → reduce confidence by 10; cite explicitly
+ setup_direction == "neutral" → HOLD (no clean setup)
 
 Action-specific filling
  HOLD               → trade_decision entry/stop_loss/take_profit/rr.* = null. Forward scenario filled.
- CONDITIONAL_ENTRY  → trade_decision numeric; entry_trigger states the exact required condition.
- ACTIVE_TRADE       → trade_decision fully numeric; rr.passed must be true.
+ CONDITIONAL_ENTRY  → use engine_trade levels; entry_trigger states the exact required condition.
+ ACTIVE_TRADE       → use engine_trade levels; rr.passed must be true.
 
 Field formats
  mtf_context.<tf>.nearest_ob / nearest_fvg : "<low>-<high>" or "NONE".
@@ -780,10 +870,9 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
     """End-to-end pipeline. Returns (snapshot_dict, analysis_dict)."""
     print(f"\nAnalyzing market data for {symbol}...")
 
-    data = await fetch_ohlcv(symbol)
-    if "15m" in data and not data["15m"].empty:
-        current_price = data["15m"]["close"].iloc[-1]
-        print(f"[DEBUG] Current price for {symbol}: {current_price:.4f}")
+    data, live_price = await fetch_ohlcv(symbol)
+    if live_price is not None:
+        print(f"[DEBUG] Live price for {symbol}: {live_price:.4f} (signals on closed bars)")
 
     # External micro / macro data fetched in parallel-friendly order (sync REST)
     orderbook = fetch_orderbook(symbol)
@@ -793,15 +882,18 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
     btc_dominance = fetch_btc_dominance_proxy(symbol)
     event_guard = fetch_event_window()
 
+    # Compute each TF's value area once and reuse (avoids recomputation, B11)
+    value_areas = {tf: get_value_area(data[tf]) for tf in data}
+
     # SMC + PA contexts
-    smc_context = build_smc_context(data["4h"], data["1h"], data["15m"])
-    pa_context = build_pa_context(data["1h"], data["15m"], df_4h=data["4h"])
+    smc_context = build_smc_context(data["4h"], data["1h"], data["15m"], value_areas=value_areas)
+    pa_context = build_pa_context(data["1h"], data["15m"], df_4h=data["4h"], value_areas=value_areas)
     pdh, pdl, pdc = calculate_previous_day(data["1h"])
 
     # Volatility regimes per TF
     vol_regime = {tf: detect_volatility_regime(data[tf]) for tf in data}
 
-    # Single trend-bias source (SMC-driven) used inside detect_regime
+    # Global regime (SMC-driven); drives regime-conditional scoring
     regime = detect_regime(data["4h"], data["1h"], data["15m"], smc_context=smc_context)
 
     # 1H Supertrend pulled out for the dashboard pill
@@ -814,15 +906,18 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
 
     strategies = evaluate_strategies(
         data["4h"], data["1h"], data["15m"],
-        orderbook, funding, sentiment,
+        orderbook, funding, sentiment, open_interest,
         smc_context=smc_context,
         windowed_indicators=windowed_indicators,
+        pa_context=pa_context,
+        market_regime=regime,
     )
 
     snapshot = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "symbol": symbol,
+        "live_price": live_price,
         "market_regime": regime,
         "volatility_regime": vol_regime,
         "event_guard": event_guard,
@@ -836,6 +931,7 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
         "smc_context": smc_context,
         "price_action": pa_context,
         "strategies": strategies,
+        "engine_trade": strategies.get("engine_trade"),
         "windowed_indicators": windowed_indicators,
     }
     snapshot_native = to_native(snapshot)
@@ -843,6 +939,9 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
     print("Generating structured trade plan from Gemini...")
     analysis = query_gemini(snapshot_native)
     snapshot_native["analysis"] = analysis
+
+    # Attach chart OHLC AFTER the LLM call so it never inflates the prompt.
+    snapshot_native["chart_series"] = build_chart_series(data)
 
     os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -875,7 +974,7 @@ async def main():
         else:
             print(f"Unknown argument '{arg}'. Defaulting to SOL/USDT.")
     else:
-        print("\n=== Cryptera v3.1 Core Engine ===")
+        print("\n=== Cryptera v3.2 Core Engine ===")
         print("1. SOL/USDT (default)")
         print("2. BTC/USDT")
         print("3. ETH/USDT")
