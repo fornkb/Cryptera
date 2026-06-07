@@ -22,7 +22,7 @@ from smc import build_smc_context
 from price_action import build_pa_context, calculate_previous_day, get_value_area
 
 
-SCHEMA_VERSION = "3.2.1"
+SCHEMA_VERSION = "3.2.3"
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
@@ -506,7 +506,21 @@ ICT/SMC institutional trade engine. Return a JSON object matching the enforced s
 Rules
 1. Use only numbers present in the snapshot. Never invent levels.
 2. `strategies.confluence_score` is authoritative (already includes the order-flow modifier). Echo it; only set `header.score_override` on a specific factual error.
-3. `strategies.engine_trade` is the engine's deterministic entry/SL/TP, built ONLY from real structural levels. PREFER it. You may refine within ~0.3% but must not invent far-away levels. `engine_trade.rr` / `rr_passed` is the HONEST structural R:R — the engine never inflates TP to hit 2R. If `rr_passed` is false, the nearest real target is < 2R: do NOT move TP further out; instead downgrade the action (CONDITIONAL_ENTRY or HOLD) or note the reduced R:R. If `engine_trade.valid` is false there is no sound structural trade → HOLD.
+3. TRADE PLAN = SELECT THE BEST REAL CANDIDATE, NEVER INVENT. This is the highest-stakes decision in the output — the score only says *whether*; the candidate you pick decides the actual outcome. Choose deliberately.
+   `strategies.engine_trade` gives a deterministic primary (entry/stop_loss/take_profit/rr) AND a candidate menu in `engine_trade.candidates`. Each candidate carries quality metadata — USE IT to rank, do not just take the nearest:
+     - `candidates.entries[]` {price, source, tf, hvn, zone, confluence, confluence_count} — choose ONE as `trade_decision.entry`
+     - `candidates.stops[]`   {price, source, tf} — choose ONE as `trade_decision.stop_loss`
+     - `candidates.targets[]` {price, source, rr, tf, confluence, confluence_count} — choose targets; `rr` is from the primary entry/SL
+   RANKING RULES (apply in this order):
+     a. Higher `confluence_count` wins — a level where multiple sources stack (e.g. VAH+BSL+POC) is far stronger than an isolated one.
+     b. `hvn: true` order blocks > plain OBs; higher `tf` (4h > 1h > 15m) levels are more significant.
+     c. ENTRIES: prefer `zone` matching the trade — `discount` for longs, `premium` for shorts.
+     d. TARGETS: a target sitting just BEFORE a higher-TF level/resistance is safer than one at/through it.
+     e. `rr` is the TIE-BREAKER between otherwise-equal candidates, not the primary filter.
+   Every price you output (entry / stop_loss / take_profit / tp1 / tp2 / move_to_breakeven_at) MUST be a value from these candidate lists or the engine primary. Never output a price not in the snapshot.
+   Default to the engine primary UNLESS a candidate is clearly higher-quality by the rules above. Set `trade_management.selected_from_engine` = true if you echo the primary, false otherwise, and in `selection_rationale` COMPARE your pick against the primary and the next-best candidate ("chose X (confluence 3, HVN) over primary Y because …").
+   `engine_trade.rr` / `rr_passed` is the HONEST structural R:R — the engine never inflates TP to hit 2R. If the chosen final TP gives < 2R, do NOT move it further out; downgrade the action (CONDITIONAL_ENTRY / HOLD). If `engine_trade.valid` is false there is no sound structural trade → HOLD.
+   TRADE MANAGEMENT: `tp1` = nearest HIGH-CONFLUENCE target (the first strong stacked level), `tp2` = a farther runner (>= 2R if available); set `tp1_rr`/`tp2_rr` from the candidate's `rr`; `move_to_breakeven_at` = tp1 or a candidate level between entry and tp1; `scale_out` describes the split (e.g. "50% at TP1, move SL to BE, 50% runner to TP2").
 
 Regime-conditional scoring — read `strategies.score_mode`:
  score_mode == "trend" (trending regime): components C1-C8 measure trend continuation.
@@ -534,9 +548,9 @@ Gates
  setup_direction == "neutral" → HOLD (no clean setup)
 
 Action-specific filling
- HOLD               → trade_decision entry/stop_loss/take_profit/rr.* = null. Forward scenario filled.
- CONDITIONAL_ENTRY  → use engine_trade levels; entry_trigger states the exact required condition.
- ACTIVE_TRADE       → use engine_trade levels; engine_trade.rr_passed must be true (never invent a 2R TP).
+ HOLD               → trade_decision entry/stop_loss/take_profit/rr.* and all trade_management price fields = null; selected_from_engine=true, scale_out="n/a". Forward scenario filled.
+ CONDITIONAL_ENTRY  → select levels from engine_trade.candidates; entry_trigger states the exact required condition; fill trade_management.
+ ACTIVE_TRADE       → select levels from engine_trade.candidates; final R:R must be >= 2 (never invent a 2R TP); fill trade_management with tp1/tp2 + BE + scale_out.
 
 Field formats
  mtf_context.<tf>.nearest_ob / nearest_fvg : "<low>-<high>" or "NONE".
@@ -689,6 +703,24 @@ GEMINI_RESPONSE_SCHEMA = {
                 "entry_trigger": _STR,
                 "invalidation": _STR,
                 "counter_structure": _BOOL,
+                "trade_management": {
+                    "type": "object",
+                    "properties": {
+                        "selected_from_engine": _BOOL,
+                        "selection_rationale": _STR,
+                        "tp1": _NUM_NULL,
+                        "tp1_source": _STR,
+                        "tp1_rr": _NUM_NULL,
+                        "tp2": _NUM_NULL,
+                        "tp2_source": _STR,
+                        "tp2_rr": _NUM_NULL,
+                        "move_to_breakeven_at": _NUM_NULL,
+                        "scale_out": _STR,
+                    },
+                    "required": ["selected_from_engine", "selection_rationale",
+                                 "tp1", "tp1_source", "tp1_rr", "tp2", "tp2_source", "tp2_rr",
+                                 "move_to_breakeven_at", "scale_out"],
+                },
                 "reasoning": {
                     "type": "object",
                     "properties": {
@@ -703,7 +735,8 @@ GEMINI_RESPONSE_SCHEMA = {
             "required": ["primary", "alternative", "entry", "entry_source",
                          "stop_loss", "stop_loss_source", "take_profit", "take_profit_source",
                          "rr", "sl_width_pct", "confidence_pct", "position_size",
-                         "entry_trigger", "invalidation", "counter_structure", "reasoning"],
+                         "entry_trigger", "invalidation", "counter_structure",
+                         "trade_management", "reasoning"],
         },
         "forward_scenario": {
             "type": "object",

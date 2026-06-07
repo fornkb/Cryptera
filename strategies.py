@@ -528,16 +528,108 @@ def _select_structural_tp(cands, entry, risk, direction):
     return beyond[-1], "farthest structural level (<2R, honest)"
 
 
+_TF_RANK = {"4h": 3, "1h": 2, "15m": 1}
+
+
+def _tf_of_source(src):
+    """Infer the level's timeframe from its source label (VAH/VAL/POC are 1H)."""
+    s = (src or "").lower()
+    if "4h" in s:
+        return "4h"
+    if "15m" in s:
+        return "15m"
+    if "1h" in s:
+        return "1h"
+    return "1h"
+
+
+def _zone_of(level, dealing_range):
+    """Premium / discount position of `level` inside the current dealing range."""
+    lo = (dealing_range or {}).get("low")
+    hi = (dealing_range or {}).get("high")
+    if lo is None or hi is None or hi <= lo:
+        return "neutral"
+    return "discount" if level < (lo + 0.5 * (hi - lo)) else "premium"
+
+
+def _merge_confluent(rows, tol=0.0015):
+    """
+    Merge candidates whose price is within `tol` (fraction) into ONE — this turns
+    a stack of coincident levels (e.g. VAH + BSL + untested POC) into a single
+    high-confluence candidate instead of hiding it via de-dup (#2). The first
+    (already nearest-first) is the representative; stacked sources, the strongest
+    TF, and any HVN flag are accumulated. `rows` are dicts with {price, source, hvn}.
+    """
+    merged = []
+    for r in rows:
+        hit = next((m for m in merged
+                    if abs(r["price"] - m["price"]) / max(abs(m["price"]), 1e-9) <= tol), None)
+        if hit:
+            hit["_sources"].append(r["source"])
+            hit["_hvn"] = hit["_hvn"] or bool(r.get("hvn"))
+        else:
+            merged.append({"price": r["price"], "source": r["source"],
+                           "_sources": [r["source"]], "_hvn": bool(r.get("hvn"))})
+    for m in merged:
+        srcs = m.pop("_sources")
+        m["confluence"] = srcs
+        m["confluence_count"] = len(srcs)
+        m["tf"] = max((_tf_of_source(s) for s in srcs), key=lambda t: _TF_RANK.get(t, 1))
+        m["hvn"] = bool(m.pop("_hvn"))
+    return merged
+
+
+def _rank_entries(labeled, ref_price, dealing_range):
+    """
+    labeled: [(price, source, hvn)] -> confluence-merged, nearest-first entry
+    candidates, each annotated with tf, hvn, confluence stack, and premium/discount
+    zone (#1).
+    """
+    rows = [{"price": round(float(p), 6), "source": s, "hvn": bool(h)}
+            for p, s, h in labeled if p is not None]
+    rows.sort(key=lambda x: abs(x["price"] - ref_price))
+    merged = _merge_confluent(rows)
+    for m in merged:
+        m["zone"] = _zone_of(m["price"], dealing_range)
+    return merged
+
+
+def _rank_targets(labeled, entry, risk, direction):
+    """
+    labeled: [(price, source)] -> confluence-merged targets strictly beyond entry,
+    nearest first, each with R:R, tf, and confluence stack. HVN is not meaningful
+    for targets so it is dropped.
+    """
+    rows = []
+    for p, s in labeled:
+        if p is None:
+            continue
+        if direction == "bullish" and p <= entry:
+            continue
+        if direction == "bearish" and p >= entry:
+            continue
+        rows.append({"price": round(float(p), 6), "source": s, "hvn": False})
+    rows.sort(key=lambda x: abs(x["price"] - entry))
+    merged = _merge_confluent(rows)
+    for m in merged:
+        m.pop("hvn", None)
+        m["rr"] = round(abs(m["price"] - entry) / risk, 2) if risk > 0 else None
+    return merged
+
+
 def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
                            regime, score_mode, mr_edge=None):
     """
-    Propose entry / SL / TP deterministically. The LLM refines within these
-    bounds rather than inventing levels. Returns a dict; 'valid' False when no
-    sound geometry exists.
+    Deterministic trade geometry. Emits a single reproducible PRIMARY entry/SL/TP
+    (for backtesting/calibration) PLUS a ranked set of REAL candidate levels
+    (entries / stops / targets, each with source and R:R). The LLM selects and
+    manages a trade FROM this candidate menu — it never invents prices. Returns a
+    dict; 'valid' False when no sound structural trade exists.
     """
     out = {"valid": False, "direction": None, "entry": None, "stop_loss": None,
            "take_profit": None, "rr": None, "rr_passed": False,
-           "entry_source": None, "stop_loss_source": None, "take_profit_source": None}
+           "entry_source": None, "stop_loss_source": None, "take_profit_source": None,
+           "candidates": {"entries": [], "stops": [], "targets": []}}
     if direction not in ("bullish", "bearish") or price <= 0:
         return out
 
@@ -551,69 +643,88 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
 
     # Anchored VWAP levels are real dynamic S/R — valid structural targets (P4)
     avwap = pa.get("avwap", {}) or {}
-    avwap_vals = []
+    avwap_pairs = []
     for tfk in ("15m", "1h"):
         for kk in ("from_swing_high", "from_swing_low"):
             v = (avwap.get(tfk) or {}).get(kk)
             if v:
-                avwap_vals.append(v)
+                avwap_pairs.append((v, f"{tfk} AVWAP"))
+
+    entry_labeled, stop_labeled, target_labeled = [], [], []
 
     if score_mode == "mean_revert" and mr_edge:
-        # fade the edge back toward POC / opposite edge (real structural targets)
         if direction == "bearish":
             entry, e_src = mr_edge, "VAH (range top)"
-            sl = mr_edge + buf * 2
-            sl_src = "above VAH + ATR buffer"
-            tp_cands = [va.get("poc"), va.get("val")]
+            sl, sl_src = mr_edge + buf * 2, "above VAH + ATR buffer"
+            entry_labeled = [(mr_edge, "VAH (range top)", False), (price, "current price", False)]
+            stop_labeled = [(sl, sl_src)]
+            target_labeled = [(va.get("poc"), "POC"), (va.get("val"), "VAL")]
             tp_src = "POC / VAL fade target"
         else:
             entry, e_src = mr_edge, "VAL (range bottom)"
-            sl = mr_edge - buf * 2
-            sl_src = "below VAL + ATR buffer"
-            tp_cands = [va.get("poc"), va.get("vah")]
+            sl, sl_src = mr_edge - buf * 2, "below VAL + ATR buffer"
+            entry_labeled = [(mr_edge, "VAL (range bottom)", False), (price, "current price", False)]
+            stop_labeled = [(sl, sl_src)]
+            target_labeled = [(va.get("poc"), "POC"), (va.get("vah"), "VAH")]
             tp_src = "POC / VAH fade target"
     else:
         # trend continuation: pull back to OB/FVG, target next opposing liquidity
         obs = ctx15.get("order_blocks", {}).get(direction, []) or []
         fvg = (ctx15.get("fvg", {}) or {}).get(f"nearest_{direction}_fvg")
         if direction == "bullish":
-            entry_cands = [ob["top"] for ob in obs] + ([fvg["top"]] if fvg and not fvg.get("filled", True) else [])
-            entry_cands = [e for e in entry_cands if e <= price * 1.002]
-            entry = max(entry_cands) if entry_cands else price
-            e_src = "15m bull OB/FVG" if entry_cands else "current price"
+            ob_entries = [(ob["top"], "15m bull OB", bool(ob.get("high_volume_node"))) for ob in obs]
+            if fvg and not fvg.get("filled", True):
+                ob_entries.append((fvg["top"], "15m bull FVG", False))
+            valid_entries = [(p, s, h) for p, s, h in ob_entries if p <= price * 1.002]
+            entry = max((p for p, _, _ in valid_entries), default=price)
+            e_src = next((s for p, s, _ in valid_entries if p == entry), "current price")
+            entry_labeled = valid_entries + [(price, "current price", False)]
             swing_low = liq15.get("sell_side", [None])[0] or ctx15.get("dealing_range", {}).get("low")
             sl = (swing_low - buf) if swing_low else price - buf * 3
             sl_src = "below 15m swing low - buffer"
-            tp_cands = (liq15.get("buy_side", []) or []) + (liq1h.get("buy_side", []) or []) + untested + \
-                       avwap_vals + ([va.get("vah")] if va.get("vah") else [])
+            stop_labeled = [(sl, sl_src)]
+            dr_low = ctx15.get("dealing_range", {}).get("low")
+            if dr_low and abs((dr_low - buf) - sl) / max(sl, 1e-9) > 0.0005:
+                stop_labeled.append((dr_low - buf, "below dealing-range low - buffer"))
+            target_labeled = [(l, "15m BSL") for l in (liq15.get("buy_side", []) or [])] + \
+                             [(l, "1h BSL") for l in (liq1h.get("buy_side", []) or [])] + \
+                             [(l, "untested 4H POC") for l in untested] + \
+                             avwap_pairs + ([(va.get("vah"), "VAH")] if va.get("vah") else [])
             tp_src = "BSL / untested POC / AVWAP / VAH"
         else:
-            entry_cands = [ob["bottom"] for ob in obs] + ([fvg["bottom"]] if fvg and not fvg.get("filled", True) else [])
-            entry_cands = [e for e in entry_cands if e >= price * 0.998]
-            entry = min(entry_cands) if entry_cands else price
-            e_src = "15m bear OB/FVG" if entry_cands else "current price"
+            ob_entries = [(ob["bottom"], "15m bear OB", bool(ob.get("high_volume_node"))) for ob in obs]
+            if fvg and not fvg.get("filled", True):
+                ob_entries.append((fvg["bottom"], "15m bear FVG", False))
+            valid_entries = [(p, s, h) for p, s, h in ob_entries if p >= price * 0.998]
+            entry = min((p for p, _, _ in valid_entries), default=price)
+            e_src = next((s for p, s, _ in valid_entries if p == entry), "current price")
+            entry_labeled = valid_entries + [(price, "current price", False)]
             swing_high = liq15.get("buy_side", [None])[0] or ctx15.get("dealing_range", {}).get("high")
             sl = (swing_high + buf) if swing_high else price + buf * 3
             sl_src = "above 15m swing high + buffer"
-            tp_cands = (liq15.get("sell_side", []) or []) + (liq1h.get("sell_side", []) or []) + untested + \
-                       avwap_vals + ([va.get("val")] if va.get("val") else [])
+            stop_labeled = [(sl, sl_src)]
+            dr_high = ctx15.get("dealing_range", {}).get("high")
+            if dr_high and abs((dr_high + buf) - sl) / max(sl, 1e-9) > 0.0005:
+                stop_labeled.append((dr_high + buf, "above dealing-range high + buffer"))
+            target_labeled = [(l, "15m SSL") for l in (liq15.get("sell_side", []) or [])] + \
+                             [(l, "1h SSL") for l in (liq1h.get("sell_side", []) or [])] + \
+                             [(l, "untested 4H POC") for l in untested] + \
+                             avwap_pairs + ([(va.get("val"), "VAL")] if va.get("val") else [])
             tp_src = "SSL / untested POC / AVWAP / VAL"
 
     if entry is None or sl is None or entry == sl:
         return out
-
     risk = abs(entry - sl)
     if risk <= 0:
         return out
 
-    # Target REAL structural levels only — never invent a TP (P1 fix).
+    # PRIMARY target — real structural levels only, never invented (P1 fix).
+    tp_prices = [p for p, _ in target_labeled]
     if score_mode == "mean_revert":
-        # mean-reversion takes the nearest real target (e.g. POC) at honest R:R
-        tp = _nearest_level(tp_cands, entry, direction)
+        tp = _nearest_level(tp_prices, entry, direction)
         tp_note = "nearest fade target"
     else:
-        # trend prefers the nearest level that satisfies 2R, else the farthest real one
-        tp, tp_note = _select_structural_tp(tp_cands, entry, risk, direction)
+        tp, tp_note = _select_structural_tp(tp_prices, entry, risk, direction)
     if tp is None:
         return out  # no structural target in the trade direction -> no sound trade
     tp_src = f"{tp_src} [{tp_note}]"
@@ -633,6 +744,12 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
         "entry_source": e_src,
         "stop_loss_source": sl_src,
         "take_profit_source": tp_src,
+        "candidates": {
+            "entries": _rank_entries(entry_labeled, price, ctx15.get("dealing_range", {})),
+            "stops": [{"price": round(float(p), 6), "source": s, "tf": _tf_of_source(s)}
+                      for p, s in stop_labeled if p is not None],
+            "targets": _rank_targets(target_labeled, entry, risk, direction),
+        },
     })
     return out
 

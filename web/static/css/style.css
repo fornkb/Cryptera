@@ -796,6 +796,8 @@ select:focus, input[type="text"]:focus {
     line-height: 1.35;
 }
 
+.conf-tag { display: inline-block; background: rgba(99, 102, 241, 0.22); color: #c4b5fd; border: 1px solid rgba(99, 102, 241, 0.45); border-radius: 3px; padding: 0 4px; font-size: 8px; margin-left: 3px; font-weight: 700; }
+.tf-tag { display: inline-block; background: rgba(148, 163, 184, 0.15); color: #cbd5e1; border-radius: 3px; padding: 0 4px; font-size: 8px; margin-left: 3px; }
 .fresh-tag { display: inline-block; background: rgba(16, 185, 129, 0.18); color: #6ee7b7; border-radius: 3px; padding: 0 4px; font-size: 8px; margin-left: 4px; }
 .disp-tag  { display: inline-block; background: rgba(245, 158, 11, 0.18); color: #fcd34d; border-radius: 3px; padding: 0 4px; font-size: 8px; margin-left: 4px; }
 

@@ -25,6 +25,7 @@ snapshots/
 # eval_engine --out reports
 reports/
 improvements_report.md
+CLAUDE.md
 # engine-managed OI history fallback
 data/oi_history.json
 # fitted weights (machine/data-specific, regenerate)
@@ -41,3 +42,4 @@ Thumbs.db
 
 
 
+CLAUDE.md

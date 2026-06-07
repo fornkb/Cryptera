@@ -76,6 +76,14 @@ document.addEventListener("DOMContentLoaded", () => {
     const valTakeProfit = $("val-take-profit");
     const valRR = $("val-rr");
     const valOrderFlow = $("val-order-flow");
+    const valTp1 = $("val-tp1");
+    const srcTp1 = $("src-tp1");
+    const valTp2 = $("val-tp2");
+    const srcTp2 = $("src-tp2");
+    const valBe = $("val-be");
+    const valScaleOut = $("val-scale-out");
+    const valLadderContainer = $("val-ladder-container");
+    const valEntryStopContainer = $("val-entrystop-container");
 
     const scoreBreakdownTitle = $("score-breakdown-title");
     const scoreBreakdownGrid = $("score-breakdown-grid");
@@ -113,6 +121,7 @@ document.addEventListener("DOMContentLoaded", () => {
     let priceChart = null;
     let chartTf = "15m";
     let lastSnapshot = null;
+    let lastAnalysis = null;
 
     // ---- helpers ----
     const fmtNum = (v, d = 2) => (v === null || v === undefined || Number.isNaN(Number(v))) ? "—" : Number(v).toFixed(d);
@@ -281,6 +290,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // -- trade plan: prefer deterministic engine_trade, fall back to LLM --
         renderTradePlan(engine, tradeDecision);
+        renderManagement(tradeDecision);
+        renderCandidates(engine);
 
         // -- order-flow notes --
         const ofNotes = strategies.order_flow_notes || [];
@@ -320,6 +331,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // -- price chart with SMC level overlays --
         lastSnapshot = snapshot;
+        lastAnalysis = analysis;
         renderChart(snapshot);
 
         // -- narrative + forward scenario --
@@ -378,6 +390,67 @@ document.addEventListener("DOMContentLoaded", () => {
                 valRR.textContent = "—";
                 valRR.className = "metric-value font-mono";
             }
+        }
+    };
+
+    // ---- trade management (LLM partials / BE / scale, selected from real candidates) ----
+    const renderManagement = (tradeDecision) => {
+        const tm = (tradeDecision && tradeDecision.trade_management) || {};
+        const tpTxt = (v, rr) => v == null ? "—" : `${fmtNum(v)}${rr != null ? ` (${Number(rr).toFixed(2)}R)` : ""}`;
+        safeText(valTp1, tpTxt(tm.tp1, tm.tp1_rr), "—");
+        safeText(valTp2, tpTxt(tm.tp2, tm.tp2_rr), "—");
+        safeText(srcTp1, tm.tp1_source ? `· ${tm.tp1_source}` : "", "");
+        safeText(srcTp2, tm.tp2_source ? `· ${tm.tp2_source}` : "", "");
+        safeText(valBe, tm.move_to_breakeven_at != null ? fmtNum(tm.move_to_breakeven_at) : "—", "—");
+        safeText(valScaleOut, tm.scale_out, "—");
+        if (valScaleOut) valScaleOut.title = tm.selection_rationale || "";
+    };
+
+    // ---- engine candidate menu (real levels the LLM selects from) ----
+    const confBadge = (n) => (n && n > 1) ? ` <span class="conf-tag">×${n}</span>` : "";
+    const tfBadge = (tf) => tf ? ` <span class="tf-tag">${String(tf).toUpperCase()}</span>` : "";
+
+    const renderCandidates = (engine) => {
+        const cands = (engine && engine.candidates) || {};
+        // target ladder with R:R + confluence + tf
+        valLadderContainer.innerHTML = "";
+        const targets = cands.targets || [];
+        if (!targets.length) {
+            valLadderContainer.innerHTML = `<div class="box-message">No trade candidates.</div>`;
+        } else {
+            const ul = document.createElement("ul");
+            ul.className = "levels-ul";
+            targets.forEach(t => {
+                const rr = t.rr != null ? Number(t.rr) : null;
+                const cls = rr != null && rr >= 2 ? "text-green" : rr != null && rr >= 1 ? "text-amber" : "";
+                const srcs = (t.confluence && t.confluence.length) ? t.confluence.join(" + ") : (t.source || "");
+                ul.innerHTML += `<li class="level-li-item" title="${srcs}">
+                    <span class="font-mono">${fmtNum(t.price)}${tfBadge(t.tf)}${confBadge(t.confluence_count)} <span class="src-note">${srcs}</span></span>
+                    <span class="font-mono ${cls}">${rr != null ? rr.toFixed(2) + "R" : "—"}</span></li>`;
+            });
+            valLadderContainer.appendChild(ul);
+        }
+        // entry / stop options with quality flags (hvn / zone / confluence / tf)
+        valEntryStopContainer.innerHTML = "";
+        const entries = cands.entries || [];
+        const stops = cands.stops || [];
+        if (!entries.length && !stops.length) {
+            valEntryStopContainer.innerHTML = `<div class="box-message">No entry/stop candidates.</div>`;
+        } else {
+            const ul = document.createElement("ul");
+            ul.className = "levels-ul";
+            entries.forEach(e => {
+                const hvn = e.hvn ? ' <span class="hvn-tag">HVN</span>' : "";
+                const zone = (e.zone && e.zone !== "neutral") ? ` <span class="src-note">${e.zone}</span>` : "";
+                const srcs = (e.confluence && e.confluence.length) ? e.confluence.join(" + ") : (e.source || "");
+                ul.innerHTML += `<li class="level-li-item" title="${srcs}">
+                    <span class="text-green">ENTRY${tfBadge(e.tf)}${confBadge(e.confluence_count)}${hvn}</span>
+                    <span class="font-mono">${fmtNum(e.price)}${zone}</span></li>`;
+            });
+            stops.forEach(s => {
+                ul.innerHTML += `<li class="level-li-item"><span class="text-red">STOP${tfBadge(s.tf)}</span><span class="font-mono">${fmtNum(s.price)} <span class="src-note">${s.source}</span></span></li>`;
+            });
+            valEntryStopContainer.appendChild(ul);
         }
     };
 
@@ -643,6 +716,11 @@ document.addEventListener("DOMContentLoaded", () => {
             addLine(eng.stop_loss, "#ef4444", "SL", LS.Solid, true);
             addLine(eng.take_profit, "#10b981", "TP", LS.Solid, true);
         }
+
+        // 1b) LLM trade-management partials (TP1/TP2) selected from real candidates
+        const tm = ((lastAnalysis || {}).trade_decision || {}).trade_management || {};
+        addLine(tm.tp1, "rgba(16,185,129,0.6)", "TP1", LS.Dashed, false);
+        addLine(tm.tp2, "rgba(16,185,129,0.85)", "TP2", LS.Dashed, false);
 
         // 2) Value area for the selected timeframe
         const pa = snapshot.price_action || {};

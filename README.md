@@ -169,11 +169,28 @@ The engine reads `market_regime` and selects a rubric, exposed as
 price, F&G extremes, and **BTC-dominance** macro headwind/tailwind for alts —
 `final = clamp(base + modifier, 0, 100)`.
 
-**Trade geometry (honest R:R):** the engine targets only real structural levels
-(liquidity pools, untested POCs, anchored VWAP, value-area edges). For trend
-trades it picks the nearest target that satisfies 2R, else the farthest real
-level with an honest sub-2R `rr` — it **never invents a TP** to force 2R. If no
-structural target exists, `engine_trade.valid = false` and the action is HOLD.
+**Trade geometry (honest R:R + candidate menu):** the engine emits a
+deterministic, reproducible **primary** entry/SL/TP built only from real
+structural levels (liquidity pools, untested POCs, anchored VWAP, value-area
+edges) — it picks the nearest target that satisfies 2R, else the farthest real
+level with an honest sub-2R `rr`, and **never invents a TP** to force 2R. If no
+structural target exists, `engine_trade.valid = false` → HOLD.
+
+Alongside the primary it emits `engine_trade.candidates` — a **ranked menu of
+real levels** the LLM selects from (it can never invent a price). Each candidate
+carries **quality metadata** so the model can rank by strength, not just
+proximity:
+- `entries[]` — `{price, source, tf, hvn, zone, confluence, confluence_count}`
+- `stops[]` — `{price, source, tf}`
+- `targets[]` — `{price, source, rr, tf, confluence, confluence_count}`
+
+Coincident levels are **merged** (not de-duped) into a single high-`confluence`
+candidate — e.g. a VAH that lines up with a 1H BSL and an untested POC surfaces
+as `confluence_count: 3` instead of being hidden. The LLM is instructed to rank
+by confluence, HVN, timeframe, and premium/discount zone, with R:R as the
+tie-breaker, then add **trade management** (TP1/TP2 partials, move-to-breakeven,
+scale-out). Geometry stays deterministic and backtestable; the LLM contributes
+judgment (level selection, partials, veto), not arithmetic.
 
 **Decision gates:**
 
@@ -185,7 +202,7 @@ structural target exists, `engine_trade.valid = false` and the action is HOLD.
 
 ---
 
-## Snapshot schema (`schema_version = 3.2.1`)
+## Snapshot schema (`schema_version = 3.2.3`)
 
 Top-level keys written to each `snapshots/snapshot_*.json`:
 
@@ -202,7 +219,8 @@ Top-level keys written to each `snapshots/snapshot_*.json`:
 | `btc_dominance_proxy` | BTCDOM/USDT 4h/24h change (non-BTC symbols only)                         |
 | `smc_context`         | per-TF structure, BOS/CHoCH (fresh+displacement), OB, FVG, BSL/SSL, P/D, OTE, dealing range, developing swings |
 | `price_action`        | per-TF value area, S/R, PDH/PDL/PDC, untested 4H POCs, anchored VWAP, candle pattern |
-| `strategies`          | score_mode, score + breakdown + notes, order-flow modifier, volume gate, `engine_trade`, empirical win-rate |
+| `strategies`          | score_mode, score + breakdown + notes, order-flow modifier, volume gate, empirical win-rate, `engine_trade` (primary geometry + `candidates` menu of real entries/stops/targets) |
+| `analysis.trade_decision.trade_management` | LLM-selected TP1/TP2 partials (with R:R), move-to-breakeven, scale-out — all chosen from the candidate menu |
 | `windowed_indicators` | per-TF compressed indicator summary (incl. `cvd_is_real`)                |
 | `analysis`            | the parsed Gemini JSON trade plan                                        |
 | `chart_series`        | compact OHLC per TF for the chart — added **after** the LLM call         |
@@ -246,6 +264,21 @@ removals are implemented in 3.2. Still open:
 ---
 
 ## Changelog
+
+**3.2.3** — enriched candidate metadata: each entry/stop/target now carries
+timeframe, HVN flag, premium/discount zone, and a **confluence stack**
+(coincident levels are merged, not de-duped, surfacing the strongest targets
+instead of hiding them). The LLM rubric gains an explicit quality-ranking order
+(confluence → HVN/TF → zone → R:R tie-break) and is asked to justify its pick
+against the primary and next-best candidate. Dashboard candidate panels show the
+new ×N confluence / HVN / TF / zone badges.
+
+**3.2.2** — ranked candidate-set trade geometry: the engine emits a menu of real
+entries / stops / targets (each with R:R) alongside the deterministic primary;
+the LLM **selects** from the menu (never invents) and adds trade management
+(TP1/TP2 partials, move-to-breakeven, scale-out). Dashboard gains a management
+panel, a target ladder with R:R, an entry/stop options panel, and TP1/TP2 chart
+overlays. Geometry remains deterministic and backtestable.
 
 **3.2.1** — honest trade geometry (never inflates TP to force 2R — targets real
 levels only, reports sub-2R R:R, or HOLDs when no structural target); ATR-scaled
