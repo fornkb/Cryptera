@@ -22,7 +22,7 @@ from smc import build_smc_context
 from price_action import build_pa_context, calculate_previous_day, get_value_area
 
 
-SCHEMA_VERSION = "3.2.0"
+SCHEMA_VERSION = "3.2.1"
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
@@ -506,7 +506,7 @@ ICT/SMC institutional trade engine. Return a JSON object matching the enforced s
 Rules
 1. Use only numbers present in the snapshot. Never invent levels.
 2. `strategies.confluence_score` is authoritative (already includes the order-flow modifier). Echo it; only set `header.score_override` on a specific factual error.
-3. `strategies.engine_trade` is the engine's deterministic entry/SL/TP. PREFER it. You may refine within ~0.3% but must not invent far-away levels; if you deviate, say why in reasoning. Enforce min 1:2 R:R.
+3. `strategies.engine_trade` is the engine's deterministic entry/SL/TP, built ONLY from real structural levels. PREFER it. You may refine within ~0.3% but must not invent far-away levels. `engine_trade.rr` / `rr_passed` is the HONEST structural R:R — the engine never inflates TP to hit 2R. If `rr_passed` is false, the nearest real target is < 2R: do NOT move TP further out; instead downgrade the action (CONDITIONAL_ENTRY or HOLD) or note the reduced R:R. If `engine_trade.valid` is false there is no sound structural trade → HOLD.
 
 Regime-conditional scoring — read `strategies.score_mode`:
  score_mode == "trend" (trending regime): components C1-C8 measure trend continuation.
@@ -519,7 +519,9 @@ Regime-conditional scoring — read `strategies.score_mode`:
    Direction = SELL near VAH, BUY near VAL. `setup_direction` carries this.
 
 Order flow: `strategies.order_flow_modifier` (already in the score) reflects L2 depth imbalance,
-funding crowding, OI build and F&G extremes — cite `order_flow_notes` in the sentiment reasoning.
+funding crowding + trajectory, OI build, F&G extremes, and BTC-dominance (alt macro headwind) —
+cite `order_flow_notes` in the sentiment reasoning. `price_action.avwap` holds anchored-VWAP
+dynamic S/R from the last swing high/low; cite it as a level when relevant.
 
 Thresholds
  score >= 60 → ACTIVE_TRADE   45-59 → CONDITIONAL_ENTRY   < 45 → HOLD
@@ -534,7 +536,7 @@ Gates
 Action-specific filling
  HOLD               → trade_decision entry/stop_loss/take_profit/rr.* = null. Forward scenario filled.
  CONDITIONAL_ENTRY  → use engine_trade levels; entry_trigger states the exact required condition.
- ACTIVE_TRADE       → use engine_trade levels; rr.passed must be true.
+ ACTIVE_TRADE       → use engine_trade levels; engine_trade.rr_passed must be true (never invent a 2R TP).
 
 Field formats
  mtf_context.<tf>.nearest_ob / nearest_fvg : "<low>-<high>" or "NONE".
@@ -911,6 +913,7 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
         windowed_indicators=windowed_indicators,
         pa_context=pa_context,
         market_regime=regime,
+        btc_dominance=btc_dominance,
     )
 
     snapshot = {

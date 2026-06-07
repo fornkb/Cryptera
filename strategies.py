@@ -120,26 +120,40 @@ def detect_mtf_sweep(df_15m: pd.DataFrame, smc_context: dict, pdh: float, pdl: f
     if not pools:
         return 0, "no pools", "none"
 
+    # A genuine stop-run (Judas swing) is aggressive: it spikes through the pool and
+    # gets rejected within the SAME candle, leaving a dominant rejection wick. Require
+    # the rejection wick beyond the pool to be >= 40% of the candle range (P4) so slow
+    # "acceptance" reclaims with tiny wicks don't qualify.
+    WICK_FRAC = 0.40
     recent = df_15m.tail(5)
     best_rank = 0
     best_tier = "none"
     for _, candle in recent.iterrows():
-        c_high, c_low, c_close = float(candle["high"]), float(candle["low"]), float(candle["close"])
+        c_high, c_low = float(candle["high"]), float(candle["low"])
+        c_open, c_close = float(candle["open"]), float(candle["close"])
+        rng = c_high - c_low
+        if rng <= 0:
+            continue
         if trend_bias == "bullish":
-            # sweep a sell-side pool (run the lows) then reclaim above it
+            lower_wick = min(c_open, c_close) - c_low
+            if lower_wick < WICK_FRAC * rng:
+                continue  # weak reclaim, not an aggressive sweep
             for price, side, tier, rank in pools:
                 if side == "sell" and c_low < price and c_close > price and rank > best_rank:
                     best_rank, best_tier = rank, tier
         else:
+            upper_wick = c_high - max(c_open, c_close)
+            if upper_wick < WICK_FRAC * rng:
+                continue
             for price, side, tier, rank in pools:
                 if side == "buy" and c_high > price and c_close < price and rank > best_rank:
                     best_rank, best_tier = rank, tier
 
     if best_rank >= 2:
-        return 10, f"HTF sweep+reclaim ({best_tier})", best_tier
+        return 10, f"HTF sweep+reclaim, wick-confirmed ({best_tier})", best_tier
     if best_rank == 1:
-        return 6, "15m sweep+reclaim", "15m"
-    return 0, "no sweep", "none"
+        return 6, "15m sweep+reclaim, wick-confirmed", "15m"
+    return 0, "no aggressive sweep", "none"
 
 
 # ---------------- trend-continuation components (C1-C8) ---------------- #
@@ -160,36 +174,47 @@ def _c1_trend(smc_context, windowed):
     return 25, f"very strong ADX {adx:.1f}"
 
 
-def _c2_ob_prox(price, smc_context, bias):
+def _c2_ob_prox(price, smc_context, bias, atr_abs):
+    """ATR-scaled OB/FVG proximity (P2). Falls back to fixed % only if ATR is missing."""
     if bias not in ("bullish", "bearish"):
         return 0, "neutral bias"
     direction = "bullish" if bias == "bullish" else "bearish"
-    best, label = None, "none"
+    best, label = None, "none"  # best = ABSOLUTE distance
     for tf in ("15m", "1h"):
         ctx = smc_context.get(tf, {}) or {}
         for ob in ctx.get("order_blocks", {}).get(direction, []) or []:
             edge = ob.get("bottom") if direction == "bullish" else ob.get("top")
             if edge is None:
                 continue
-            d = abs(price - edge) / price
+            d = abs(price - edge)
             if best is None or d < best:
                 best, label = d, f"{tf.upper()} {direction} OB"
         fv = (ctx.get("fvg", {}) or {}).get(f"nearest_{direction}_fvg")
         if fv and not fv.get("filled", True):
             edge = fv.get("top") if direction == "bullish" else fv.get("bottom")
             if edge is not None:
-                d = abs(price - edge) / price
+                d = abs(price - edge)
                 if best is None or d < best:
                     best, label = d, f"{tf.upper()} {direction} FVG"
     if best is None:
         return 0, "no nearby OB/FVG"
-    if best <= 0.003:
-        return 15, f"{label} {best*100:.2f}% away"
-    if best <= 0.005:
-        return 10, f"{label} {best*100:.2f}% away"
-    if best <= 0.01:
-        return 5, f"{label} {best*100:.2f}% away"
-    return 0, f"nearest {label} {best*100:.2f}% (>1%)"
+    if atr_abs and atr_abs > 0:
+        d_atr = best / atr_abs
+        if d_atr <= 0.5:
+            return 15, f"{label} {d_atr:.2f} ATR away"
+        if d_atr <= 1.0:
+            return 10, f"{label} {d_atr:.2f} ATR away"
+        if d_atr <= 2.0:
+            return 5, f"{label} {d_atr:.2f} ATR away"
+        return 0, f"nearest {label} {d_atr:.2f} ATR (>2 ATR)"
+    pct = best / price if price else 1.0
+    if pct <= 0.003:
+        return 15, f"{label} {pct*100:.2f}% away"
+    if pct <= 0.005:
+        return 10, f"{label} {pct*100:.2f}% away"
+    if pct <= 0.01:
+        return 5, f"{label} {pct*100:.2f}% away"
+    return 0, f"nearest {label} {pct*100:.2f}% (>1%)"
 
 
 def _c4_momentum(df_1h, windowed, bias):
@@ -217,7 +242,8 @@ def _c4_momentum(df_1h, windowed, bias):
     return max(0, min(15, base + adj)), f"RSI {rsi:.1f}, {lbl}"
 
 
-def _c5_fvg_magnet(price, smc_context, bias):
+def _c5_fvg_magnet(price, smc_context, bias, atr_map):
+    """ATR-scaled FVG-magnet range (P2): within 3x the FVG's own-TF ATR. % fallback."""
     if bias not in ("bullish", "bearish"):
         return 0, "neutral bias"
     direction = "bullish" if bias == "bullish" else "bearish"
@@ -228,9 +254,15 @@ def _c5_fvg_magnet(price, smc_context, bias):
             if top is None or bot is None:
                 continue
             mid = (top + bot) / 2
-            if mid > 0 and abs(price - mid) / price <= 0.03:
-                return 15, f"{tf.upper()} {direction} FVG {abs(price-mid)/price*100:.2f}% away"
-    return 0, "no FVG within 3%"
+            if mid <= 0:
+                continue
+            dist = abs(price - mid)
+            atr_tf = (atr_map or {}).get(tf, 0.0)
+            limit = (3.0 * atr_tf) if (atr_tf and atr_tf > 0) else (price * 0.03)
+            if dist <= limit:
+                unit = f"{dist/atr_tf:.2f} ATR" if (atr_tf and atr_tf > 0) else f"{dist/price*100:.2f}%"
+                return 15, f"{tf.upper()} {direction} FVG {unit} away"
+    return 0, "no FVG magnet within range"
 
 
 def _c6_ote(smc_context):
@@ -360,42 +392,52 @@ def _volume_gate(windowed):
 
 # ---------------- order-flow / positioning modifiers (T1-4) ---------------- #
 
-def _order_flow_modifier(direction, orderbook, funding, open_interest, sentiment, windowed):
+def _order_flow_modifier(direction, orderbook, funding, open_interest, sentiment, windowed,
+                         btc_dominance=None):
     """Bounded [-8, +8] confirmation/veto from non-price data. direction in bull/bear."""
     if direction not in ("bullish", "bearish"):
         return 0, ["neutral bias - order flow not scored"]
     notes = []
     mod = 0
 
-    # 1) L2 depth imbalance at the tightest band
+    # 1) L2 depth imbalance at the tightest band (de-weighted: L2 is spoofable)
     bins = (orderbook or {}).get("depth_bins") or []
     if bins:
         imb = float(bins[0].get("imbalance", 0.0))  # +bid heavy
         want = 1 if direction == "bullish" else -1
         agree = (imb * want) > 0
-        if abs(imb) >= 0.2:
-            mod += 4 if agree else -4
-            notes.append(f"depth {'supports' if agree else 'opposes'} ({imb:+.2f} @±{bins[0].get('band_pct')}%)")
-        elif abs(imb) >= 0.08:
+        if abs(imb) >= 0.25:
             mod += 2 if agree else -2
+            notes.append(f"depth {'supports' if agree else 'opposes'} ({imb:+.2f} @±{bins[0].get('band_pct')}%)")
+        elif abs(imb) >= 0.1:
+            mod += 1 if agree else -1
             notes.append(f"depth mild {'support' if agree else 'opposition'} ({imb:+.2f})")
 
-    # 2) Funding: penalise entering WITH the crowd at an extreme; reward tailwind
+    # 2) Funding: penalise entering WITH the crowd at an extreme; factor trajectory
     f = funding or {}
     pct = f.get("percentile_window")
     cur = f.get("current")
+    trend = (f.get("trend") or "").lower()
     if pct is not None and cur is not None:
         if direction == "bullish":
             if pct >= 80 and cur > 0:
                 mod -= 3
-                notes.append(f"crowded longs (funding p{pct:.0f})")
+                note = f"crowded longs (funding p{pct:.0f}"
+                if trend == "rising":
+                    mod -= 1
+                    note += ", rising - squeeze risk"
+                notes.append(note + ")")
             elif pct <= 20 and cur < 0:
                 mod += 2
                 notes.append(f"shorts paying (funding p{pct:.0f}) - long tailwind")
         else:
             if pct <= 20 and cur < 0:
                 mod -= 3
-                notes.append(f"crowded shorts (funding p{pct:.0f})")
+                note = f"crowded shorts (funding p{pct:.0f}"
+                if trend == "falling":
+                    mod -= 1
+                    note += ", falling - squeeze risk"
+                notes.append(note + ")")
             elif pct >= 80 and cur > 0:
                 mod += 2
                 notes.append(f"longs paying (funding p{pct:.0f}) - short tailwind")
@@ -429,6 +471,26 @@ def _order_flow_modifier(direction, orderbook, funding, open_interest, sentiment
             mod += 2
             notes.append(f"extreme greed F&G {sentiment} - contrarian short")
 
+    # 5) BTC dominance (alts only): rising BTC.D = rotation into BTC, alts bleed.
+    #    `btc_dominance` is None for BTC itself, so this is skipped there.
+    btcd = btc_dominance or {}
+    dchg = btcd.get("change_4h_pct")
+    if dchg is not None:
+        if direction == "bullish":
+            if dchg >= 0.5:
+                mod -= 4
+                notes.append(f"BTC.D rising +{dchg:.2f}% 4h - macro headwind for alt long")
+            elif dchg <= -0.5:
+                mod += 2
+                notes.append(f"BTC.D falling {dchg:.2f}% 4h - alt tailwind")
+        else:
+            if dchg >= 0.5:
+                mod += 2
+                notes.append(f"BTC.D rising +{dchg:.2f}% 4h - alt short tailwind")
+            elif dchg <= -0.5:
+                mod -= 3
+                notes.append(f"BTC.D falling {dchg:.2f}% 4h - alts strong, short headwind")
+
     mod = max(-8, min(8, mod))
     if not notes:
         notes.append("order flow neutral")
@@ -437,11 +499,33 @@ def _order_flow_modifier(direction, orderbook, funding, open_interest, sentiment
 
 # ---------------- deterministic trade geometry (T1-5) ---------------- #
 
-def _nearest(levels, price, above):
-    cand = [l for l in levels if (l > price if above else l < price)]
-    if not cand:
-        return None
-    return min(cand) if above else max(cand)
+def _nearest_level(cands, entry, direction):
+    """Nearest real structural level beyond entry in the trade direction, or None."""
+    levels = [c for c in cands if c is not None]
+    if direction == "bullish":
+        beyond = [c for c in levels if c > entry]
+        return min(beyond) if beyond else None
+    beyond = [c for c in levels if c < entry]
+    return max(beyond) if beyond else None
+
+
+def _select_structural_tp(cands, entry, risk, direction):
+    """
+    Pick the NEAREST real structural level that yields >= 2R. If none reaches 2R,
+    return the FARTHEST available real level (honest sub-2R R:R). Never invents a
+    price out of thin air (P1 fix). Returns (tp, source_note) or (None, None).
+    """
+    levels = [c for c in cands if c is not None]
+    if direction == "bullish":
+        beyond = sorted(c for c in levels if c > entry)
+    else:
+        beyond = sorted((c for c in levels if c < entry), reverse=True)
+    if not beyond:
+        return None, None
+    for c in beyond:
+        if abs(c - entry) >= 2 * risk:
+            return c, "nearest >=2R structural level"
+    return beyond[-1], "farthest structural level (<2R, honest)"
 
 
 def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
@@ -465,26 +549,33 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
     va = pa.get("value_area_1h", {}) or {}
     untested = [u["poc"] for u in pa.get("untested_pocs_4h", []) or []]
 
+    # Anchored VWAP levels are real dynamic S/R — valid structural targets (P4)
+    avwap = pa.get("avwap", {}) or {}
+    avwap_vals = []
+    for tfk in ("15m", "1h"):
+        for kk in ("from_swing_high", "from_swing_low"):
+            v = (avwap.get(tfk) or {}).get(kk)
+            if v:
+                avwap_vals.append(v)
+
     if score_mode == "mean_revert" and mr_edge:
-        # fade the edge back toward POC / opposite edge
-        poc = va.get("poc")
+        # fade the edge back toward POC / opposite edge (real structural targets)
         if direction == "bearish":
             entry, e_src = mr_edge, "VAH (range top)"
             sl = mr_edge + buf * 2
             sl_src = "above VAH + ATR buffer"
-            tp = poc if poc and poc < entry else va.get("val")
-            tp_src = "POC" if (poc and poc < entry) else "VAL"
+            tp_cands = [va.get("poc"), va.get("val")]
+            tp_src = "POC / VAL fade target"
         else:
             entry, e_src = mr_edge, "VAL (range bottom)"
             sl = mr_edge - buf * 2
             sl_src = "below VAL + ATR buffer"
-            tp = poc if poc and poc > entry else va.get("vah")
-            tp_src = "POC" if (poc and poc > entry) else "VAH"
+            tp_cands = [va.get("poc"), va.get("vah")]
+            tp_src = "POC / VAH fade target"
     else:
         # trend continuation: pull back to OB/FVG, target next opposing liquidity
-        direction_key = "bullish" if direction == "bullish" else "bearish"
-        obs = ctx15.get("order_blocks", {}).get(direction_key, []) or []
-        fvg = (ctx15.get("fvg", {}) or {}).get(f"nearest_{direction_key}_fvg")
+        obs = ctx15.get("order_blocks", {}).get(direction, []) or []
+        fvg = (ctx15.get("fvg", {}) or {}).get(f"nearest_{direction}_fvg")
         if direction == "bullish":
             entry_cands = [ob["top"] for ob in obs] + ([fvg["top"]] if fvg and not fvg.get("filled", True) else [])
             entry_cands = [e for e in entry_cands if e <= price * 1.002]
@@ -494,9 +585,8 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
             sl = (swing_low - buf) if swing_low else price - buf * 3
             sl_src = "below 15m swing low - buffer"
             tp_cands = (liq15.get("buy_side", []) or []) + (liq1h.get("buy_side", []) or []) + untested + \
-                       ([va.get("vah")] if va.get("vah") else [])
-            tp = _nearest([t for t in tp_cands if t], entry, above=True)
-            tp_src = "next BSL / untested POC / VAH"
+                       avwap_vals + ([va.get("vah")] if va.get("vah") else [])
+            tp_src = "BSL / untested POC / AVWAP / VAH"
         else:
             entry_cands = [ob["bottom"] for ob in obs] + ([fvg["bottom"]] if fvg and not fvg.get("filled", True) else [])
             entry_cands = [e for e in entry_cands if e >= price * 0.998]
@@ -506,9 +596,8 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
             sl = (swing_high + buf) if swing_high else price + buf * 3
             sl_src = "above 15m swing high + buffer"
             tp_cands = (liq15.get("sell_side", []) or []) + (liq1h.get("sell_side", []) or []) + untested + \
-                       ([va.get("val")] if va.get("val") else [])
-            tp = _nearest([t for t in tp_cands if t], entry, above=False)
-            tp_src = "next SSL / untested POC / VAL"
+                       avwap_vals + ([va.get("val")] if va.get("val") else [])
+            tp_src = "SSL / untested POC / AVWAP / VAL"
 
     if entry is None or sl is None or entry == sl:
         return out
@@ -517,15 +606,17 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
     if risk <= 0:
         return out
 
-    # ensure a target exists and enforce >= 2R for trend trades by extending if needed
+    # Target REAL structural levels only — never invent a TP (P1 fix).
+    if score_mode == "mean_revert":
+        # mean-reversion takes the nearest real target (e.g. POC) at honest R:R
+        tp = _nearest_level(tp_cands, entry, direction)
+        tp_note = "nearest fade target"
+    else:
+        # trend prefers the nearest level that satisfies 2R, else the farthest real one
+        tp, tp_note = _select_structural_tp(tp_cands, entry, risk, direction)
     if tp is None:
-        tp = entry + 2 * risk if direction == "bullish" else entry - 2 * risk
-        tp_src = (tp_src or "2R projection") + " (2R projection)"
-    if score_mode != "mean_revert":
-        min_tp = entry + 2 * risk if direction == "bullish" else entry - 2 * risk
-        if (direction == "bullish" and tp < min_tp) or (direction == "bearish" and tp > min_tp):
-            tp = min_tp
-            tp_src = (tp_src or "") + " -> extended to 2R"
+        return out  # no structural target in the trade direction -> no sound trade
+    tp_src = f"{tp_src} [{tp_note}]"
 
     reward = abs(tp - entry)
     rr = round(reward / risk, 2) if risk > 0 else None
@@ -549,7 +640,8 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
 # ---------------- main evaluation ---------------- #
 
 def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, open_interest,
-                        smc_context, windowed_indicators, pa_context, market_regime) -> dict:
+                        smc_context, windowed_indicators, pa_context, market_regime,
+                        btc_dominance=None) -> dict:
     """
     Regime-conditional confluence scoring + order-flow modifiers + deterministic
     trade geometry. All previously-dead inputs (orderbook/funding/sentiment/OI)
@@ -563,6 +655,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
     mr_weights = calib.get("mr_weights", {})
     price = float(df_15m["close"].iloc[-1])
     atr_abs = _atr_abs(df_15m)
+    atr_map = {"4h": _atr_abs(df_4h), "1h": _atr_abs(df_1h), "15m": atr_abs}
     pdh = (pa_context or {}).get("pdh")
     pdl = (pa_context or {}).get("pdl")
 
@@ -597,10 +690,10 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
         score_mode = "trend"
         direction = trend_bias
         c1, n1 = _c1_trend(smc_context, windowed_indicators)
-        c2, n2 = _c2_ob_prox(price, smc_context, trend_bias)
+        c2, n2 = _c2_ob_prox(price, smc_context, trend_bias, atr_abs)
         c3, n3, c3_tier = detect_mtf_sweep(df_15m, smc_context, pdh, pdl, trend_bias)
         c4, n4 = _c4_momentum(df_1h, windowed_indicators, trend_bias)
-        c5, n5 = _c5_fvg_magnet(price, smc_context, trend_bias)
+        c5, n5 = _c5_fvg_magnet(price, smc_context, trend_bias, atr_map)
         c6, n6 = _c6_ote(smc_context)
         c7, n7, absorption = _c7_cvd(windowed_indicators, trend_bias)
         c8, n8 = _c8_stoch(windowed_indicators, trend_bias)
@@ -619,7 +712,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
 
     # order-flow / positioning modifier
     of_mod, of_notes = _order_flow_modifier(geo_bias, orderbook, funding, open_interest,
-                                            sentiment, windowed_indicators)
+                                            sentiment, windowed_indicators, btc_dominance)
     final = int(max(0, min(100, base + of_mod)))
 
     gate = _volume_gate(windowed_indicators)

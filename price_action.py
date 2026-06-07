@@ -8,7 +8,7 @@ Candle-pattern detection is limited to confirmation-grade reversal patterns.
 
 import pandas as pd
 import numpy as np
-from smc import find_swings
+from smc import find_swings, fractal_swing_mask, SWING_WIDTHS, DEFAULT_WIDTH
 
 
 def _atr_pct(df: pd.DataFrame, fallback: float = 0.005) -> float:
@@ -229,6 +229,44 @@ def find_untested_pocs(df: pd.DataFrame, n_sessions: int = 4, session_bars: int 
     return deduped[:5]
 
 
+def get_anchored_vwap(df: pd.DataFrame, anchor_idx: int):
+    """Volume-weighted average price of typical price from `anchor_idx` to now."""
+    if df is None or df.empty or anchor_idx is None or anchor_idx < 0 or anchor_idx >= len(df):
+        return None
+    seg = df.iloc[anchor_idx:]
+    vol = seg["volume"].to_numpy(dtype=float)
+    cum_vol = vol.sum()
+    if cum_vol <= 0:
+        return None
+    tp = ((seg["high"] + seg["low"] + seg["close"]) / 3.0).to_numpy(dtype=float)
+    return float((tp * vol).sum() / cum_vol)
+
+
+def compute_avwap_levels(df: pd.DataFrame, tf: str) -> dict:
+    """
+    Anchored VWAPs from the most recent confirmed swing high and swing low.
+    These are institutional dynamic S/R levels: price holding above the
+    swing-low AVWAP is bullish control; rejecting the swing-high AVWAP is
+    bearish control.
+    """
+    if df is None or df.empty:
+        return {}
+    left, right = SWING_WIDTHS.get(tf, DEFAULT_WIDTH)
+    is_high, is_low = fractal_swing_mask(df["high"], df["low"], left, right)
+    out = {}
+    hi_idx = np.flatnonzero(is_high.to_numpy())
+    lo_idx = np.flatnonzero(is_low.to_numpy())
+    if len(hi_idx):
+        v = get_anchored_vwap(df, int(hi_idx[-1]))
+        if v is not None:
+            out["from_swing_high"] = round(v, 6)
+    if len(lo_idx):
+        v = get_anchored_vwap(df, int(lo_idx[-1]))
+        if v is not None:
+            out["from_swing_low"] = round(v, 6)
+    return out
+
+
 def build_pa_context(df_1h, df_15m, df_4h=None, value_areas: dict = None) -> dict:
     """value_areas: optional pre-computed {tf:{vah,val,poc}} to avoid recompute (B11)."""
     if df_15m is None or df_15m.empty:
@@ -252,6 +290,11 @@ def build_pa_context(df_1h, df_15m, df_4h=None, value_areas: dict = None) -> dic
 
     untested_pocs_4h = find_untested_pocs(df_4h) if df_4h is not None and not df_4h.empty else []
 
+    avwap = {
+        "15m": compute_avwap_levels(df_15m, "15m"),
+        "1h": compute_avwap_levels(df_1h, "1h") if df_1h is not None and not df_1h.empty else {},
+    }
+
     return {
         "last_candle_pattern_15m": last_pattern,
         "value_area_15m": va_15m,
@@ -259,6 +302,7 @@ def build_pa_context(df_1h, df_15m, df_4h=None, value_areas: dict = None) -> dic
         "value_area_4h": va_4h,
         "poc_1h": va_1h.get("poc", current_price),
         "sr_levels": sr_levels,
+        "avwap": avwap,
         "pdh": pdh,
         "pdl": pdl,
         "pdc": pdc,

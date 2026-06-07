@@ -683,6 +683,11 @@ document.addEventListener("DOMContentLoaded", () => {
         // 7) Untested 4H POC magnets
         (pa.untested_pocs_4h || []).slice(0, 2).forEach(p => addLine(p.poc, "rgba(245,158,11,0.85)", "naked POC", LS.LargeDashed, false));
 
+        // 8) Anchored VWAP (dynamic S/R from last swing high/low) for this TF
+        const avwapTf = (pa.avwap || {})[chartTf] || (pa.avwap || {})["1h"] || {};
+        addLine(avwapTf.from_swing_low, "rgba(56,189,248,0.7)", "AVWAP↓", LS.Dashed, false);
+        addLine(avwapTf.from_swing_high, "rgba(236,72,153,0.7)", "AVWAP↑", LS.Dashed, false);
+
         chart.timeScale().fitContent();
         priceChart = chart;
 

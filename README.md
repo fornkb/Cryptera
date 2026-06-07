@@ -145,10 +145,10 @@ The engine reads `market_regime` and selects a rubric, exposed as
 | component        | max | rule                                                           |
 | ---------------- | --- | -------------------------------------------------------------- |
 | C1 trend         | 25  | ADX-tiered when 4H/1H structure agrees; +10 base on conflict   |
-| C2 OB proximity  | 15  | 0/5/10/15 by distance to nearest 15m or 1H OB/FVG edge         |
-| C3 sweep         | 10  | HTF sweep+reclaim (4H/1H/PDH-PDL); 6 if 15m-only               |
+| C2 OB proximity  | 15  | 0/5/10/15 by **ATR-scaled** distance to nearest 15m/1H OB/FVG edge |
+| C3 sweep         | 10  | HTF sweep+reclaim (4H/1H/PDH-PDL), **wick-confirmed**; 6 if 15m-only |
 | C4 momentum      | 15  | +10 if 1H RSI/MACD aligns with bias; ±5 RSI-slope adjustment   |
-| C5 FVG magnet    | 15  | unfilled draw-on-liquidity FVG within 3% on 1H or 4H           |
+| C5 FVG magnet    | 15  | unfilled draw-on-liquidity FVG within **3× ATR** on 1H or 4H   |
 | C6 OTE bonus     | 10  | `in_ote = true` on 1H or 4H                                    |
 | C7 CVD alignment | 10  | 2+ TF real-CVD signs match bias; 0 if 15m opposes 4H           |
 | C8 StochRSI      | 5   | overbought (sell) / oversold (buy) on 1H                       |
@@ -164,9 +164,16 @@ The engine reads `market_regime` and selects a rubric, exposed as
 | M5 rejection        | 10  | reversal candle (pin/engulfing/star) in the fade direction  |
 | M6 range intact     | 10  | no fresh 1H BOS/CHoCH (range still valid)                   |
 
-**Order-flow modifier (both modes):** bounded ±8 from L2 depth imbalance,
-funding crowding, OI build vs. price, and F&G extremes —
+**Order-flow modifier (both modes):** bounded ±8 from L2 depth imbalance
+(de-weighted — L2 is spoofable), funding crowding + trajectory, OI build vs.
+price, F&G extremes, and **BTC-dominance** macro headwind/tailwind for alts —
 `final = clamp(base + modifier, 0, 100)`.
+
+**Trade geometry (honest R:R):** the engine targets only real structural levels
+(liquidity pools, untested POCs, anchored VWAP, value-area edges). For trend
+trades it picks the nearest target that satisfies 2R, else the farthest real
+level with an honest sub-2R `rr` — it **never invents a TP** to force 2R. If no
+structural target exists, `engine_trade.valid = false` and the action is HOLD.
 
 **Decision gates:**
 
@@ -178,7 +185,7 @@ funding crowding, OI build vs. price, and F&G extremes —
 
 ---
 
-## Snapshot schema (`schema_version = 3.2.0`)
+## Snapshot schema (`schema_version = 3.2.1`)
 
 Top-level keys written to each `snapshots/snapshot_*.json`:
 
@@ -194,7 +201,7 @@ Top-level keys written to each `snapshots/snapshot_*.json`:
 | `open_interest`       | value + 1h/4h delta + 30-day percentile                                  |
 | `btc_dominance_proxy` | BTCDOM/USDT 4h/24h change (non-BTC symbols only)                         |
 | `smc_context`         | per-TF structure, BOS/CHoCH (fresh+displacement), OB, FVG, BSL/SSL, P/D, OTE, dealing range, developing swings |
-| `price_action`        | per-TF value area, S/R, PDH/PDL/PDC, untested 4H POCs, candle pattern    |
+| `price_action`        | per-TF value area, S/R, PDH/PDL/PDC, untested 4H POCs, anchored VWAP, candle pattern |
 | `strategies`          | score_mode, score + breakdown + notes, order-flow modifier, volume gate, `engine_trade`, empirical win-rate |
 | `windowed_indicators` | per-TF compressed indicator summary (incl. `cvd_is_real`)                |
 | `analysis`            | the parsed Gemini JSON trade plan                                        |
@@ -239,6 +246,13 @@ removals are implemented in 3.2. Still open:
 ---
 
 ## Changelog
+
+**3.2.1** — honest trade geometry (never inflates TP to force 2R — targets real
+levels only, reports sub-2R R:R, or HOLDs when no structural target); ATR-scaled
+C2/C5 proximity tiers; BTC-dominance macro gate + funding-trajectory term in the
+order-flow modifier (L2 depth de-weighted); wick-confirmed liquidity sweeps;
+anchored VWAP (from last swing high/low) in the snapshot, geometry targets, and
+chart overlay.
 
 **3.2** — regime-conditional scoring (trend/mean-revert); closed-candle signals;
 real taker-flow CVD; range-distributed volume profile; order flow in the score;
